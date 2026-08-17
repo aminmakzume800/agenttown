@@ -26,6 +26,8 @@ from app.config import settings
 from app.memory import init_memory_table, get_history, clear_history
 from app.market_data import get_current_price, get_market_summary, get_candles
 from app.db import close_position as db_close_position
+from app.tts import synthesize as tts_synthesize, is_available as tts_available
+from fastapi.responses import Response
 
 from uuid import uuid4
 from datetime import datetime
@@ -66,6 +68,12 @@ class DecisionRequest(BaseModel):
 
 class ClosePositionRequest(BaseModel):
     position_id: str
+
+
+class TTSRequest(BaseModel):
+    text: str
+    agent_key: str = ""
+    lang: str = "en"
 
 
 # Pending proposals awaiting a Manager decision, keyed by proposal id.
@@ -205,6 +213,31 @@ def get_status():
         "open_positions": len(positions),
         "daily_pnl": pnl,
     }
+
+
+# --- Voice ---
+
+@app.post("/tts")
+def tts(req: TTSRequest):
+    """Synthesise one chunk of speech with NVIDIA Magpie.
+
+    Returns 503 when unavailable so the browser can fall back to its own
+    voice rather than the agent going silent.
+    """
+    audio = tts_synthesize(req.text, agent_key=req.agent_key, lang=req.lang)
+    if not audio:
+        raise HTTPException(status_code=503, detail="TTS unavailable — use browser fallback")
+    return Response(
+        content=audio,
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/tts/status")
+def tts_status():
+    """Whether neural TTS is configured, so the UI can pick its engine."""
+    return {"ok": True, "neural": tts_available(), "engine": "nvidia-magpie"}
 
 
 # --- Trade Pipeline ---

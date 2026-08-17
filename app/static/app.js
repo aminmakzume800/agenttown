@@ -14,6 +14,11 @@ const MIC_SILENCE_MS = 4000;  // how long to wait on silence before auto-sending
 const SPEECH_RATE = 0.88;     // < 1 is slower and clearer than the default
 const SENTENCE_PAUSE_MS = 340;  // breath between sentences
 const CLAUSE_PAUSE_MS = 150;    // shorter breath after a comma break
+const CONVO_SILENCE_MS = 2800;  // hands-free: silence before the turn ends
+const MIN_UTTERANCE_MS = 700;   // ignore a stray click or cough as a full turn
+const VAD_LEVEL = 14;           // mic level that counts as "still talking"
+const BARGE_LEVEL = 38;         // louder bar to interrupt the agent mid-sentence
+const BARGE_FRAMES = 6;         // consecutive loud frames before cutting off
 
 /* ── Desk layout (tile coords) ──────────────────────────── */
 const DESKS = [
@@ -53,6 +58,7 @@ const S = {
     streaming: false,
     streamTimer: null,
     speaking: null,   // agent_key currently being voiced
+    converse: false,  // hands-free conversation mode
     ws: null,
     wsTimer: null,
     player: { x: 9.5 * TILE, y: 6 * TILE, dir: 'down', moving: false, frame: 0, tick: 0 },
@@ -69,7 +75,7 @@ const D = {};
  'sysProfileTitle','sysProfileDesc','rosterBody','tickers','acctStats','btSymbol','btTf',
  'runBt','btResult','positions','auditList','gestureGrid','gestureTarget','refreshHub',
  'blotterMode','pendCount','pendingList','openCount','blotterOpen','execLog','refreshBlotter',
- 'clearBtn'
+ 'clearBtn','convoBtn'
 ].forEach(id => D[id] = document.getElementById(id));
 
 const ctx  = D.officeCanvas.getContext('2d');
@@ -84,6 +90,7 @@ function init() {
     resize();
     window.addEventListener('resize', resize);
     bindUI();
+    initTTS();
     loadAgents();
     connectWS();
     requestAnimationFrame(loop);
@@ -112,6 +119,7 @@ function bindUI() {
     D.voiceBtn.classList.add('on');
     D.terminateBtn.onclick = terminate;
     D.clearBtn.onclick = clearHistory;
+    D.convoBtn.onclick = toggleConverse;
     D.killBtn.onclick = toggleKill;
     D.langToggle.onchange = e => { S.lang = e.target.value; };
 
@@ -577,9 +585,18 @@ function speechClean(t) {
 const speechQ = [];
 let speechBusy = false;
 let speechGen = 0;          // bumped on stop, so stale callbacks are ignored
+let neuralTTS = false;      // NVIDIA Magpie available
+let curAudio = null;        // <audio> element currently playing
+
+/* Ask the backend once whether neural TTS is configured. */
+async function initTTS() {
+    try {
+        const j = await (await fetch('/tts/status')).json();
+        neuralTTS = !!j.neural;
+    } catch (_) { neuralTTS = false; }
+}
 
 function speak(t, agentKey) {
-    if (!('speechSynthesis' in window)) return;
     const clean = speechClean(t);
     if (!clean) return;
 
@@ -603,6 +620,47 @@ function pumpSpeech() {
     if (item.gen !== speechGen) return pumpSpeech();   // cancelled mid-flight
 
     speechBusy = true;
+    S.speaking = item.agent;
+
+    const done = () => {
+        speechBusy = false;
+        if (item.gen !== speechGen) return;
+        if (speechQ.length) setTimeout(pumpSpeech, item.pause);
+        else { S.speaking = null; onSpeechIdle(); }
+    };
+
+    if (neuralTTS) playNeural(item, done);
+    else playBrowser(item, done);
+}
+
+/* NVIDIA Magpie — neural voice. Falls back to the browser on any failure. */
+async function playNeural(item, done) {
+    try {
+        const r = await fetch('/tts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: item.text, agent_key: item.agent, lang: S.lang }),
+        });
+        if (!r.ok) throw new Error('tts ' + r.status);
+        if (item.gen !== speechGen) return done();
+
+        const url = URL.createObjectURL(await r.blob());
+        const a = new Audio(url);
+        curAudio = a;
+        a.onended = () => { URL.revokeObjectURL(url); curAudio = null; done(); };
+        a.onerror = () => { URL.revokeObjectURL(url); curAudio = null; playBrowser(item, done); };
+        await a.play();
+    } catch (_) {
+        // One failure is enough to stop paying the round-trip cost this session.
+        neuralTTS = false;
+        playBrowser(item, done);
+    }
+}
+
+/* Browser Web Speech API — always available, lower quality. */
+function playBrowser(item, done) {
+    if (!('speechSynthesis' in window)) return done();
+
     const u = new SpeechSynthesisUtterance(item.text);
     const lang = S.lang === 'bn' ? 'bn' : 'en';
 
@@ -615,15 +673,8 @@ function pumpSpeech() {
     u.pitch = tone.pitch;
     u.volume = 0.9;
 
-    u.onstart = () => { S.speaking = item.agent; };
-    u.onend = () => {
-        speechBusy = false;
-        if (item.gen !== speechGen) return;
-        if (speechQ.length) setTimeout(pumpSpeech, item.pause);
-        else S.speaking = null;
-    };
+    u.onend = done;
     u.onerror = () => { speechBusy = false; S.speaking = null; setTimeout(pumpSpeech, 60); };
-
     speechSynthesis.speak(u);
 }
 
@@ -632,6 +683,7 @@ function stopSpeech() {
     speechQ.length = 0;
     speechBusy = false;
     S.speaking = null;
+    if (curAudio) { try { curAudio.pause(); } catch (_) {} curAudio = null; }
     if ('speechSynthesis' in window) speechSynthesis.cancel();
 }
 
@@ -643,8 +695,9 @@ function stopSpeech() {
    ─────────────────────────────────────────────────────── */
 let rec = null;
 let micOn = false;          // user intent, survives Chrome's auto-stops
-let micFinal = '';          // committed transcript so far
+let micCommitted = '';      // text from earlier recogniser sessions this turn
 let micSilenceTimer = null;
+let micStartedAt = 0;
 
 function toggleMic() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -655,10 +708,13 @@ function toggleMic() {
 
 function startMic(SR) {
     micOn = true;
-    micFinal = '';
+    micCommitted = '';
+    micStartedAt = Date.now();
+    D.chatInput.value = '';
     D.micBtn.classList.add('rec');
-    D.chatInput.placeholder = 'Listening… click the mic again when you are done';
+    D.chatInput.placeholder = 'Listening… take your time';
     stopSpeech();               // don't transcribe our own TTS
+    ensureVAD();                // level meter keeps the turn open while you talk
     spawnRecognizer(SR);
     armSilence();
 }
@@ -671,14 +727,12 @@ function spawnRecognizer(SR) {
     rec.maxAlternatives = 1;
 
     rec.onresult = e => {
-        let interim = '';
-        for (let k = e.resultIndex; k < e.results.length; k++) {
-            const r = e.results[k];
-            if (r.isFinal) micFinal += r[0].transcript;
-            else interim += r[0].transcript;
-        }
-        D.chatInput.value = (micFinal + interim).trimStart();
-        armSilence();           // speech heard — reset the silence countdown
+        // Rebuild this session's transcript from scratch each time. Appending
+        // per-event double-counts finals, which produced repeated words.
+        let cur = '';
+        for (let k = 0; k < e.results.length; k++) cur += e.results[k][0].transcript;
+        D.chatInput.value = (micCommitted + cur).replace(/\s+/g, ' ').trimStart();
+        armSilence();
     };
 
     rec.onerror = e => {
@@ -690,10 +744,12 @@ function spawnRecognizer(SR) {
     };
 
     rec.onend = () => {
-        // Chrome stops on its own; restart while the user is still holding the turn.
-        if (micOn) {
-            try { rec.start(); } catch (_) { /* already starting */ }
-        }
+        // Chrome ends recognition on its own every so often. Commit what this
+        // session heard, then restart while the user still holds the turn.
+        if (!micOn) return;
+        const sofar = D.chatInput.value.trim();
+        micCommitted = sofar ? sofar + ' ' : '';
+        try { rec.start(); } catch (_) { /* already starting */ }
     };
 
     try { rec.start(); } catch (_) { /* already started */ }
@@ -701,19 +757,153 @@ function spawnRecognizer(SR) {
 
 function armSilence() {
     clearTimeout(micSilenceTimer);
-    micSilenceTimer = setTimeout(() => { if (micOn) stopMic(true); }, MIC_SILENCE_MS);
+    const wait = S.converse ? CONVO_SILENCE_MS : MIC_SILENCE_MS;
+    micSilenceTimer = setTimeout(() => {
+        if (!micOn) return;
+        // Guard against a cough or click ending the turn instantly.
+        if (Date.now() - micStartedAt < MIN_UTTERANCE_MS) return armSilence();
+        stopMic(true);
+    }, wait);
 }
 
 function stopMic(autoSend) {
     micOn = false;
     clearTimeout(micSilenceTimer);
     micSilenceTimer = null;
-    if (rec) { try { rec.stop(); } catch (_) {} rec = null; }
+    if (rec) { try { rec.onend = null; rec.stop(); } catch (_) {} rec = null; }
     D.micBtn.classList.remove('rec');
     D.chatInput.placeholder = 'Ask the active agent…';
 
     const said = D.chatInput.value.trim();
     if (autoSend && said) send();
+    else if (S.converse && !said) scheduleConvoListen();   // heard nothing, keep the loop alive
+}
+
+/* ── HANDS-FREE CONVERSATION ──────────────────────────────
+   Agent finishes speaking -> mic opens by itself. You start talking while it
+   is still speaking -> speech cuts out immediately (barge-in) and your words
+   are captured instead. No buttons in the loop.
+   ─────────────────────────────────────────────────────── */
+let convoTimer = null;
+
+function toggleConverse() {
+    if (!S.active && !S.converse) {
+        alert('Activate an agent first — walk to a desk and press E.');
+        return;
+    }
+    S.converse = !S.converse;
+    D.convoBtn.classList.toggle('on', S.converse);
+    D.convoBtn.textContent = S.converse ? 'CONVERSING' : 'CONVERSE';
+
+    if (S.converse) {
+        if (!S.voice) {                     // conversation needs the voice on
+            S.voice = true;
+            D.voiceBtn.textContent = 'VOICE ON';
+            D.voiceBtn.classList.add('on');
+        }
+        sysLine('Conversation mode on. Just talk — interrupt any time.');
+        startBargeWatch();
+        scheduleConvoListen(400);
+    } else {
+        clearTimeout(convoTimer);
+        stopBargeWatch();
+        if (micOn) stopMic(false);
+        sysLine('Conversation mode off.');
+    }
+}
+
+/* Open the mic once the agent has stopped talking. */
+function scheduleConvoListen(delay) {
+    clearTimeout(convoTimer);
+    if (!S.converse) return;
+    convoTimer = setTimeout(() => {
+        if (!S.converse || micOn || S.streaming || S.speaking) return;
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SR) startMic(SR);
+    }, delay || 550);
+}
+
+/* Called when the speech queue drains. */
+function onSpeechIdle() {
+    if (S.converse) scheduleConvoListen();
+}
+
+/* ── VOICE ACTIVITY DETECTION ─────────────────────────────
+   One analyser serves two jobs:
+
+     while listening  -> any voice keeps your turn open, so a pause between
+                         words cannot end the sentence early. The recogniser's
+                         own events are too sparse to rely on for this.
+     while speaking   -> sustained loud input means you are interrupting, so
+                         the agent is cut off.
+
+   echoCancellation is essential: without it the mic picks the agent's own
+   voice out of the speakers and the system interrupts itself.
+   ─────────────────────────────────────────────────────── */
+let vadCtx = null, vadStream = null, vadRAF = null;
+
+async function ensureVAD() {
+    if (vadCtx) return true;
+    try {
+        vadStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: true,   // don't hear our own TTS
+                noiseSuppression: true,
+                autoGainControl: true,
+            },
+        });
+        vadCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const src = vadCtx.createMediaStreamSource(vadStream);
+        const an = vadCtx.createAnalyser();
+        an.fftSize = 512;
+        an.smoothingTimeConstant = 0.75;
+        src.connect(an);
+
+        const buf = new Uint8Array(an.frequencyBinCount);
+        let loud = 0;
+
+        const tick = () => {
+            an.getByteFrequencyData(buf);
+            let sum = 0;
+            for (let k = 0; k < buf.length; k++) sum += buf[k];
+            const level = sum / buf.length;
+
+            if (S.speaking) {
+                // Interrupting: needs to be clearly louder and sustained, so
+                // residual speaker bleed cannot trigger it.
+                if (S.converse && level > BARGE_LEVEL) {
+                    if (++loud >= BARGE_FRAMES) {
+                        loud = 0;
+                        stopSpeech();
+                        sysLine('— interrupted —');
+                        scheduleConvoListen(120);
+                    }
+                } else loud = 0;
+            } else if (micOn) {
+                // Listening: any voice at all means keep waiting for more.
+                if (level > VAD_LEVEL) armSilence();
+                loud = 0;
+            } else loud = 0;
+
+            vadRAF = requestAnimationFrame(tick);
+        };
+        tick();
+        return true;
+    } catch (_) {
+        sysLine('Microphone access denied — voice features need it enabled.');
+        return false;
+    }
+}
+
+function startBargeWatch() { ensureVAD(); }
+
+function stopBargeWatch() {
+    // Only tear down when nothing needs the mic any more.
+    if (micOn || S.converse) return;
+    if (vadRAF) cancelAnimationFrame(vadRAF);
+    vadRAF = null;
+    if (vadStream) { vadStream.getTracks().forEach(t => t.stop()); vadStream = null; }
+    if (vadCtx) { try { vadCtx.close(); } catch (_) {} vadCtx = null; }
 }
 
 async function clearHistory() {
@@ -763,7 +953,17 @@ function applyKill(on) {
     D.killBtn.classList.toggle('on', on);
     D.killBtn.textContent = on ? '⛔ KILL SWITCH ACTIVE — CLICK TO RELEASE'
                                : '⛔ KILL SWITCH — HALT ALL TRADING';
-    if (on) { stopSpeech(); if (micOn) stopMic(false); }
+    if (on) {
+        stopSpeech();
+        if (micOn) stopMic(false);
+        if (S.converse) {          // stop the hands-free loop too
+            S.converse = false;
+            clearTimeout(convoTimer);
+            stopBargeWatch();
+            D.convoBtn.classList.remove('on');
+            D.convoBtn.textContent = 'CONVERSE';
+        }
+    }
     if (curTab === 'blotter') loadBlotter();
 }
 

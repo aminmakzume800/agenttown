@@ -29,6 +29,18 @@ class BaseAgent:
         try:
             # Build system prompt with market context if relevant
             prompt = self.system_prompt
+
+            # Replies are read aloud, so keep them speakable: no scratchpad,
+            # no markdown scaffolding, conversational length.
+            prompt += (
+                "\n\nOUTPUT RULES:\n"
+                "- Reply directly. Never show your reasoning process or restate the question.\n"
+                "- Do not open with phrases like 'The user asks' or 'We need to answer'.\n"
+                "- Keep it under 120 words unless asked for detail.\n"
+                "- Write in plain prose that sounds natural read aloud. "
+                "Avoid tables, headers and bullet lists unless quoting exact trade levels."
+            )
+
             if lang == "bn":
                 prompt += "\n\nIMPORTANT: Respond in Bengali (বাংলা)."
 
