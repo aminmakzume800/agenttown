@@ -9,7 +9,11 @@ const TILE = 32;          // world tile size
 const COLS = 20;
 const ROWS = 13;
 const WALK_SPEED = 3.1;   // px per frame
-const STREAM_MS = 22;     // chat typing speed
+const STREAM_MS = 42;     // chat typing speed (paced to roughly track speech)
+const MIC_SILENCE_MS = 4000;  // how long to wait on silence before auto-sending
+const SPEECH_RATE = 0.88;     // < 1 is slower and clearer than the default
+const SENTENCE_PAUSE_MS = 340;  // breath between sentences
+const CLAUSE_PAUSE_MS = 150;    // shorter breath after a comma break
 
 /* ── Desk layout (tile coords) ──────────────────────────── */
 const DESKS = [
@@ -48,6 +52,7 @@ const S = {
     kill: false,
     streaming: false,
     streamTimer: null,
+    speaking: null,   // agent_key currently being voiced
     ws: null,
     wsTimer: null,
     player: { x: 9.5 * TILE, y: 6 * TILE, dir: 'down', moving: false, frame: 0, tick: 0 },
@@ -62,7 +67,9 @@ const D = {};
  'apName','apRole','apBadge','apAvatar','apTabBody','apTabText','chatLog','chatSys','chatInput',
  'sendBtn','micBtn','voiceBtn','terminateBtn','killBtn','netCanvas','orbCanvas','orbSub',
  'sysProfileTitle','sysProfileDesc','rosterBody','tickers','acctStats','btSymbol','btTf',
- 'runBt','btResult','positions','auditList','gestureGrid','gestureTarget','refreshHub'
+ 'runBt','btResult','positions','auditList','gestureGrid','gestureTarget','refreshHub',
+ 'blotterMode','pendCount','pendingList','openCount','blotterOpen','execLog','refreshBlotter',
+ 'clearBtn'
 ].forEach(id => D[id] = document.getElementById(id));
 
 const ctx  = D.officeCanvas.getContext('2d');
@@ -100,10 +107,11 @@ function bindUI() {
         S.voice = !S.voice;
         D.voiceBtn.textContent = S.voice ? 'VOICE ON' : 'VOICE OFF';
         D.voiceBtn.classList.toggle('on', S.voice);
-        if (!S.voice) speechSynthesis.cancel();
+        if (!S.voice) stopSpeech();
     };
     D.voiceBtn.classList.add('on');
     D.terminateBtn.onclick = terminate;
+    D.clearBtn.onclick = clearHistory;
     D.killBtn.onclick = toggleKill;
     D.langToggle.onchange = e => { S.lang = e.target.value; };
 
@@ -121,6 +129,7 @@ function bindUI() {
 
     D.refreshHub.onclick = loadHub;
     D.runBt.onclick = runBacktest;
+    D.refreshBlotter.onclick = loadBlotter;
 
     addEventListener('keydown', e => {
         const k = e.key.toLowerCase();
@@ -153,6 +162,7 @@ async function loadAgents() {
     fetch('/status').then(r => r.json()).then(j => {
         if (!j.ok) return;
         const live = j.trading_mode === 'live';
+        S.mode = j.trading_mode || 'paper';
         D.modeBadge.textContent = live ? 'LIVE MODE' : 'LOCAL DEMO';
         D.modeBadge.classList.toggle('live', live);
         D.orbSub.textContent = live ? 'LIVE' : 'SIMULATED';
@@ -179,6 +189,20 @@ function paintBadge(status) {
     const txt = status === 'thinking' ? 'BUSY' : status === 'offline' ? 'OFFLINE' : 'IDLE';
     D.apBadge.className = 'ap-badge ' + cls;
     D.apBadge.textContent = txt;
+}
+
+/* Badge flips to SPEAKING while the active agent's reply is being voiced. */
+function syncSpeakingBadge() {
+    if (!S.active) return;
+    const speaking = S.speaking === S.active;
+    if (speaking) {
+        if (D.apBadge.textContent !== 'SPEAKING') {
+            D.apBadge.className = 'ap-badge busy';
+            D.apBadge.textContent = 'SPEAKING';
+        }
+    } else if (D.apBadge.textContent === 'SPEAKING') {
+        paintBadge((S.byKey[S.active] || {}).status || 'idle');
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -250,12 +274,34 @@ function activate(key) {
     D.sysProfileTitle.textContent = a.name;
     D.sysProfileDesc.textContent = aspectFor(a, 'soul');
 
+    stopSpeech();
     D.chatLog.innerHTML = '';
-    sysLine(`${a.name} connected in local demo mode.`);
     D.chatInput.disabled = false;
     D.sendBtn.disabled = false;
     if (curTab === 'town') D.chatInput.focus();
     if (curTab === 'gesture') renderGestures();
+
+    loadHistory(key, a);
+}
+
+/* Replay stored conversation so the thread survives reload and restart. */
+async function loadHistory(key, a) {
+    try {
+        const j = await (await fetch(`/agent/history/${encodeURIComponent(key)}?limit=40`)).json();
+        if (S.active !== key) return;               // user moved on while fetching
+        const msgs = j.messages || [];
+        D.chatLog.innerHTML = '';
+        if (msgs.length) {
+            sysLine(`${a.name} reconnected — ${msgs.length} earlier message(s) restored.`);
+            msgs.forEach(m => bubble(m.content, m.role === 'user' ? 'me' : 'agent', false));
+        } else {
+            sysLine(`${a.name} connected in local demo mode.`);
+        }
+        scroll();
+    } catch (_) {
+        D.chatLog.innerHTML = '';
+        sysLine(`${a.name} connected in local demo mode.`);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -269,6 +315,20 @@ function sysLine(t) {
     scroll();
 }
 
+/* Split into sentence-ish chunks so speech can start on the first one
+   instead of waiting for the whole reply to finish typing. */
+function chunkText(t) {
+    const raw = t.match(/[^.!?\n]+[.!?]*\s*/g) || [t];
+    const out = [];
+    for (const c of raw) {
+        // Fold tiny fragments (abbreviations, stray numerals) into the previous
+        // chunk so the voice doesn't stutter on them.
+        if (out.length && c.trim().length < 14) out[out.length - 1] += c;
+        else out.push(c);
+    }
+    return out;
+}
+
 function bubble(text, who, stream) {
     const d = document.createElement('div');
     d.className = 'bubble ' + who;
@@ -277,18 +337,128 @@ function bubble(text, who, stream) {
 
     S.streaming = true;
     d.classList.add('typing');
+
+    // Pre-compute voice chunks and the char offset each one starts at.
+    const voiceOn = S.voice && !S.kill;
+    const chunks = voiceOn ? chunkText(text) : null;
+    const starts = [];
+    if (chunks) {
+        let acc = 0;
+        for (const c of chunks) { starts.push(acc); acc += c.length; }
+    }
+    let ci = 0;
     let i = 0;
+
     S.streamTimer = setInterval(() => {
+        // Speak each chunk the moment typing reaches it — chunk 0 fires at i=0,
+        // so the voice starts with the first character rather than at the end.
+        while (chunks && ci < chunks.length && i >= starts[ci]) {
+            speak(chunks[ci], who === 'agent' ? S.active : null);
+            ci++;
+        }
+
         if (i < text.length) { d.textContent += text[i++]; scroll(); }
         else {
             clearInterval(S.streamTimer);
             S.streamTimer = null;
             S.streaming = false;
             d.classList.remove('typing');
-            if (S.voice && !S.kill) speak(text);
+            checkProposal(text);
         }
     }, STREAM_MS);
 }
+
+/* ── proposal detection + card ── */
+async function checkProposal(text) {
+    if (!S.active) return;
+    try {
+        const r = await fetch('/trade/propose', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ agent_key: S.active, text }),
+        });
+        const j = await r.json();
+        if (j.ok && j.is_proposal) proposalCard(j);
+    } catch (_) { /* proposal parsing is best-effort */ }
+}
+
+function proposalCard(p) {
+    const o = p.order;
+    const ok = p.risk_approved;
+    const card = document.createElement('div');
+    card.className = 'prop-card' + (ok ? '' : ' vetoed');
+
+    const rr = o.rr ? `1:${o.rr}` : '—';
+    const tp = o.take_profit ? o.take_profit : '—';
+
+    card.innerHTML =
+        `<div class="prop-head"><span>TRADE PROPOSAL · ${esc(p.trading_mode.toUpperCase())}</span>` +
+        `<span class="prop-verdict">${ok ? 'RISK PASSED' : 'RISK VETO'}</span></div>` +
+        `<div class="prop-line"><span class="side-${o.side}">${o.side.toUpperCase()}</span> ` +
+        `${esc(o.symbol)} <span style="color:var(--text-dim)">@</span> ${o.entry_price}</div>` +
+        `<div class="prop-grid">` +
+        cell('Size', o.size + ' lot') +
+        cell('Stop', o.stop_loss) +
+        cell('Target', tp) +
+        cell('Risk', '$' + o.risk_usd) +
+        `</div>` +
+        `<div class="prop-checks">` +
+        p.checks.map(c => {
+            const fail = c.startsWith('✗');
+            return `<div class="prop-check ${fail ? 'fail' : 'pass'}">${esc(c)}</div>`;
+        }).join('') +
+        `</div>` +
+        (ok
+            ? `<div class="prop-actions">
+                 <button class="prop-btn approve">APPROVE &amp; EXECUTE</button>
+                 <button class="prop-btn reject">REJECT</button>
+               </div>`
+            : `<div class="prop-result bad">Blocked by the risk gate — cannot be executed.</div>`) +
+        `<div class="prop-result" hidden></div>`;
+
+    D.chatLog.appendChild(card);
+    scroll();
+
+    if (!ok) return;
+
+    const [approveBtn, rejectBtn] = card.querySelectorAll('.prop-btn');
+    const results = card.querySelectorAll('.prop-result');
+    const out = results[results.length - 1];
+
+    const finish = (cls, msg) => {
+        approveBtn.disabled = rejectBtn.disabled = true;
+        out.hidden = false;
+        out.className = 'prop-result ' + cls;
+        out.textContent = msg;
+    };
+
+    approveBtn.onclick = () => decide(true);
+    rejectBtn.onclick  = () => decide(false);
+
+    async function decide(approve) {
+        approveBtn.disabled = rejectBtn.disabled = true;
+        try {
+            const r = await fetch('/trade/decide', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ proposal_id: p.proposal_id, approve }),
+            });
+            const j = await r.json();
+            if (!approve) return finish('bad', 'Rejected by manager. Nothing sent.');
+            if (r.status === 403) return finish('bad', j.detail || 'Execution blocked.');
+            if (j.status === 'stale_risk') return finish('bad', 'Risk re-check failed at execution — order dropped.');
+            if (j.executed) {
+                const id = j.result?.order_id || j.result?.position_id || '';
+                finish('ok', `Executed in ${String(j.mode).toUpperCase()} mode. Ref ${String(id).slice(0, 8)}`);
+                if (curTab === 'blotter') loadBlotter();
+            } else {
+                finish('bad', j.detail || 'Execution failed.');
+            }
+        } catch (e) {
+            finish('bad', 'Execution request failed: ' + e.message);
+        }
+    }
+}
+
+function cell(k, v) { return `<div class="prop-cell"><div class="k">${k}</div><div class="v">${v}</div></div>`; }
 
 function dots() {
     const d = document.createElement('div');
@@ -306,6 +476,7 @@ async function send() {
     if (!text || !S.active || S.streaming) return;
     const key = S.active;
 
+    stopSpeech();               // drop any reply still being read out
     bubble(text, 'me', false);
     D.chatInput.value = '';
     setStatus(key, 'thinking');
@@ -328,28 +499,233 @@ async function send() {
     if (curTab === 'gesture') renderGestures();
 }
 
-function speak(t) {
+/* ── SPEECH ENGINE ────────────────────────────────────────
+   The browser's native queue plays utterances back-to-back with no gap,
+   which is what made it sound like fast reading. This queue drives one
+   utterance at a time and inserts a real pause between them, so sentences
+   land with a breath in between.
+   ─────────────────────────────────────────────────────── */
+
+// Voices ranked by how natural they sound. First match wins.
+const VOICE_PREFS = {
+    en: [
+        'Google UK English Female', 'Google US English',
+        'Microsoft Aria', 'Microsoft Jenny', 'Microsoft Michelle',
+        'Samantha', 'Karen', 'Moira', 'Daniel',
+    ],
+    bn: ['Google বাংলা', 'Bangla', 'Bengali'],
+};
+
+let voicesReady = false;
+let pickedVoice = { en: null, bn: null };
+
+function loadVoices() {
     if (!('speechSynthesis' in window)) return;
-    const u = new SpeechSynthesisUtterance(t.slice(0, 400));
-    u.lang = S.lang === 'bn' ? 'bn-BD' : 'en-US';
-    u.rate = 1.02; u.pitch = .95; u.volume = .75;
+    const all = speechSynthesis.getVoices();
+    if (!all.length) return;             // fires again via onvoiceschanged
+
+    for (const lang of ['en', 'bn']) {
+        const tag = lang === 'bn' ? 'bn' : 'en';
+        const pool = all.filter(v => (v.lang || '').toLowerCase().startsWith(tag));
+        let found = null;
+        for (const want of VOICE_PREFS[lang]) {
+            found = pool.find(v => (v.name || '').toLowerCase().includes(want.toLowerCase()));
+            if (found) break;
+        }
+        // Prefer a non-local (cloud) voice as fallback — they sound better.
+        pickedVoice[lang] = found || pool.find(v => !v.localService) || pool[0] || null;
+    }
+    voicesReady = true;
+}
+
+if ('speechSynthesis' in window) {
+    loadVoices();
+    speechSynthesis.onvoiceschanged = loadVoices;
+}
+
+/* Per-agent voice colour so they don't all sound like the same person. */
+const VOICE_TONE = {
+    manager:            { rate: 0.84, pitch: 0.88 },
+    risk_manager:       { rate: 0.82, pitch: 0.82 },
+    computer_scientist: { rate: 0.92, pitch: 1.00 },
+    super_trader:       { rate: 0.90, pitch: 0.95 },
+    trader_bot_1:       { rate: 0.93, pitch: 1.06 },
+    trader_bot_2:       { rate: 0.93, pitch: 0.98 },
+    trader_bot_3:       { rate: 0.94, pitch: 1.10 },
+    trader_bot_4:       { rate: 0.92, pitch: 1.02 },
+};
+
+/* Strip markdown and symbols the agents emit so they aren't read aloud. */
+function speechClean(t) {
+    return String(t)
+        .replace(/```[\s\S]*?```/g, ' code block ')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+        .replace(/[*_#>|]/g, ' ')
+        .replace(/^\s*[-–•]\s*/gm, ', ')
+        .replace(/\bR:R\b/gi, 'risk to reward')
+        .replace(/\bSL\b/g, 'stop loss')
+        .replace(/\bTP\b/g, 'take profit')
+        .replace(/\bEURUSD\b/gi, 'euro dollar')
+        .replace(/\bGBPUSD\b/gi, 'pound dollar')
+        .replace(/\bXAUUSD\b/gi, 'gold')
+        .replace(/\bNAS100\b/gi, 'nasdaq 100')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+}
+
+const speechQ = [];
+let speechBusy = false;
+let speechGen = 0;          // bumped on stop, so stale callbacks are ignored
+
+function speak(t, agentKey) {
+    if (!('speechSynthesis' in window)) return;
+    const clean = speechClean(t);
+    if (!clean) return;
+
+    // Break long sentences at commas so there is somewhere to breathe.
+    const parts = clean.length > 150 ? clean.split(/,\s+/) : [clean];
+    parts.forEach((p, idx) => {
+        if (!p.trim()) return;
+        speechQ.push({
+            text: p.trim(),
+            agent: agentKey || S.active,
+            pause: idx < parts.length - 1 ? CLAUSE_PAUSE_MS : SENTENCE_PAUSE_MS,
+            gen: speechGen,
+        });
+    });
+    pumpSpeech();
+}
+
+function pumpSpeech() {
+    if (speechBusy || !speechQ.length) return;
+    const item = speechQ.shift();
+    if (item.gen !== speechGen) return pumpSpeech();   // cancelled mid-flight
+
+    speechBusy = true;
+    const u = new SpeechSynthesisUtterance(item.text);
+    const lang = S.lang === 'bn' ? 'bn' : 'en';
+
+    if (!voicesReady) loadVoices();
+    if (pickedVoice[lang]) u.voice = pickedVoice[lang];
+    u.lang = pickedVoice[lang]?.lang || (lang === 'bn' ? 'bn-BD' : 'en-US');
+
+    const tone = VOICE_TONE[item.agent] || { rate: SPEECH_RATE, pitch: 0.95 };
+    u.rate = tone.rate;
+    u.pitch = tone.pitch;
+    u.volume = 0.9;
+
+    u.onstart = () => { S.speaking = item.agent; };
+    u.onend = () => {
+        speechBusy = false;
+        if (item.gen !== speechGen) return;
+        if (speechQ.length) setTimeout(pumpSpeech, item.pause);
+        else S.speaking = null;
+    };
+    u.onerror = () => { speechBusy = false; S.speaking = null; setTimeout(pumpSpeech, 60); };
+
     speechSynthesis.speak(u);
 }
 
-/* ── mic ── */
+function stopSpeech() {
+    speechGen++;
+    speechQ.length = 0;
+    speechBusy = false;
+    S.speaking = null;
+    if ('speechSynthesis' in window) speechSynthesis.cancel();
+}
+
+/* ── mic ──────────────────────────────────────────────────
+   Continuous dictation. Short pauses do not end the turn: the transcript
+   accumulates until you click the mic again, or MIC_SILENCE_MS of true
+   silence elapses. Chrome ends recognition on its own periodically, so we
+   restart it while the user still intends to be listening.
+   ─────────────────────────────────────────────────────── */
 let rec = null;
+let micOn = false;          // user intent, survives Chrome's auto-stops
+let micFinal = '';          // committed transcript so far
+let micSilenceTimer = null;
+
 function toggleMic() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return alert('Speech recognition unavailable in this browser.');
-    if (rec) { rec.stop(); return; }
+    if (!SR) return alert('Speech recognition unavailable in this browser. Try Chrome.');
+    if (micOn) { stopMic(true); return; }
+    startMic(SR);
+}
+
+function startMic(SR) {
+    micOn = true;
+    micFinal = '';
+    D.micBtn.classList.add('rec');
+    D.chatInput.placeholder = 'Listening… click the mic again when you are done';
+    stopSpeech();               // don't transcribe our own TTS
+    spawnRecognizer(SR);
+    armSilence();
+}
+
+function spawnRecognizer(SR) {
     rec = new SR();
     rec.lang = S.lang === 'bn' ? 'bn-BD' : 'en-US';
-    rec.interimResults = false;
-    rec.onresult = e => { D.chatInput.value = e.results[0][0].transcript; send(); };
-    rec.onend = () => { rec = null; D.micBtn.classList.remove('rec'); };
-    rec.onerror = () => { rec = null; D.micBtn.classList.remove('rec'); };
-    rec.start();
-    D.micBtn.classList.add('rec');
+    rec.continuous = true;      // keep going through pauses
+    rec.interimResults = true;  // show words as they land
+    rec.maxAlternatives = 1;
+
+    rec.onresult = e => {
+        let interim = '';
+        for (let k = e.resultIndex; k < e.results.length; k++) {
+            const r = e.results[k];
+            if (r.isFinal) micFinal += r[0].transcript;
+            else interim += r[0].transcript;
+        }
+        D.chatInput.value = (micFinal + interim).trimStart();
+        armSilence();           // speech heard — reset the silence countdown
+    };
+
+    rec.onerror = e => {
+        // 'no-speech' and 'aborted' are routine; keep the session alive.
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+            stopMic(false);
+            alert('Microphone permission was denied. Allow it in the browser site settings.');
+        }
+    };
+
+    rec.onend = () => {
+        // Chrome stops on its own; restart while the user is still holding the turn.
+        if (micOn) {
+            try { rec.start(); } catch (_) { /* already starting */ }
+        }
+    };
+
+    try { rec.start(); } catch (_) { /* already started */ }
+}
+
+function armSilence() {
+    clearTimeout(micSilenceTimer);
+    micSilenceTimer = setTimeout(() => { if (micOn) stopMic(true); }, MIC_SILENCE_MS);
+}
+
+function stopMic(autoSend) {
+    micOn = false;
+    clearTimeout(micSilenceTimer);
+    micSilenceTimer = null;
+    if (rec) { try { rec.stop(); } catch (_) {} rec = null; }
+    D.micBtn.classList.remove('rec');
+    D.chatInput.placeholder = 'Ask the active agent…';
+
+    const said = D.chatInput.value.trim();
+    if (autoSend && said) send();
+}
+
+async function clearHistory() {
+    if (!S.active) return;
+    const a = S.byKey[S.active];
+    if (!confirm(`Wipe ${a.name}'s memory and chat history? This cannot be undone.`)) return;
+    try {
+        await fetch(`/agent/history/${encodeURIComponent(S.active)}`, { method: 'DELETE' });
+        stopSpeech();
+        D.chatLog.innerHTML = '';
+        sysLine(`${a.name} memory cleared. Starting fresh.`);
+    } catch (e) { alert('Clear failed: ' + e.message); }
 }
 
 /* ── terminate / kill ── */
@@ -387,7 +763,8 @@ function applyKill(on) {
     D.killBtn.classList.toggle('on', on);
     D.killBtn.textContent = on ? '⛔ KILL SWITCH ACTIVE — CLICK TO RELEASE'
                                : '⛔ KILL SWITCH — HALT ALL TRADING';
-    if (on) speechSynthesis.cancel();
+    if (on) { stopSpeech(); if (micOn) stopMic(false); }
+    if (curTab === 'blotter') loadBlotter();
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -427,6 +804,7 @@ function wsState(cls, txt) {
    ═══════════════════════════════════════════════════════════ */
 function loop() {
     S.t++;
+    if (S.t % 6 === 0) syncSpeakingBadge();
     if (curTab === 'town') { step(); render(); }
     else { drawNet(); drawOrb(); }
     requestAnimationFrame(loop);
@@ -604,7 +982,7 @@ function drawDesk(d) {
     ctx.fillRect(x + TILE*2 - 8, y + 24, 4, 4);
 
     // seated character
-    drawSeated(x + TILE*0.5, y + TILE + 4, d.key, a, busy);
+    drawSeated(x + TILE*0.5, y + TILE + 4, d.key, a, busy, S.speaking === d.key);
 
     // nameplate
     const label = a ? a.name : d.key;
@@ -618,11 +996,11 @@ function drawDesk(d) {
     ctx.textAlign = 'left';
 }
 
-function drawSeated(cx, cy, key, a, busy) {
+function drawSeated(cx, cy, key, a, busy, talking) {
     const skin = SKINS[(a ? a.seed : 1) % SKINS.length];
     const shirt = SHIRTS[key] || SHIRTS[a && a.role] || SHIRTS.trader_bot;
     const off = a && a.status === 'offline';
-    const bob = busy ? Math.sin(S.t / 7) * 1 : 0;
+    const bob = busy ? Math.sin(S.t / 7) * 1 : (talking ? Math.sin(S.t / 5) * .6 : 0);
 
     ctx.globalAlpha = off ? .45 : 1;
     // chair back
@@ -643,7 +1021,30 @@ function drawSeated(cx, cy, key, a, busy) {
         ctx.fillRect(cx-3, cy-13 + bob, 2, 2);
         ctx.fillRect(cx+1, cy-13 + bob, 2, 2);
     }
+
+    // mouth — animates open/closed while the reply is being voiced
+    if (talking && !off) {
+        const open = (Math.floor(S.t / 5) % 2) === 0;
+        ctx.fillStyle = '#5a2b26';
+        if (open) ctx.fillRect(cx-2, cy-10 + bob, 4, 3);
+        else      ctx.fillRect(cx-2, cy-9 + bob, 4, 1);
+    }
     ctx.globalAlpha = 1;
+
+    // speech waves while talking
+    if (talking && !off) {
+        const ph = Math.floor(S.t / 6) % 3;
+        ctx.strokeStyle = '#35d6e3';
+        ctx.lineWidth = 1;
+        for (let k = 0; k < 3; k++) {
+            ctx.globalAlpha = k === ph ? .9 : .25;
+            const r = 5 + k * 3;
+            ctx.beginPath();
+            ctx.arc(cx + 9, cy - 12 + bob, r, -0.7, 0.7);
+            ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+    }
 
     // thinking bubble
     if (busy) {
@@ -771,8 +1172,114 @@ function switchTab(tab) {
     document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + tab));
     if (tab === 'agents')  renderRoster();
     if (tab === 'visual')  loadHub();
+    if (tab === 'blotter') loadBlotter();
     if (tab === 'gesture') renderGestures();
     if (tab === 'town')    resize();
+}
+
+/* ── BLOTTER ── */
+async function loadBlotter() {
+    D.blotterMode.textContent = S.kill ? 'KILL SWITCH ACTIVE' : (S.mode || 'paper');
+
+    // pending proposals
+    try {
+        const j = await (await fetch('/trade/pending')).json();
+        const p = j.pending || [];
+        D.pendCount.textContent = p.length;
+        if (!p.length) {
+            D.pendingList.innerHTML = '<div class="hub-empty">No proposals awaiting decision.</div>';
+        } else {
+            D.pendingList.innerHTML = '';
+            p.forEach(item => {
+                const o = item.order;
+                const row = document.createElement('div');
+                row.className = 'pend-row';
+                row.innerHTML =
+                    `<div><div class="pend-desc">${o.side.toUpperCase()} ${esc(o.symbol)} ${o.size} lot @ ${o.entry_price}</div>` +
+                    `<div class="pend-meta">SL ${o.stop_loss} · TP ${o.take_profit || '—'} · risk $${o.risk_usd} · from ${esc(item.agent_key)}</div></div>` +
+                    `<span class="pill ${item.risk_approved ? 'idle' : 'off'}">${item.risk_approved ? 'RISK OK' : 'VETO'}</span>` +
+                    `<span class="pend-btns"></span>`;
+                const btns = row.querySelector('.pend-btns');
+                if (item.risk_approved) {
+                    const a = mkBtn('APPROVE', async () => { await decideFromBlotter(item.proposal_id, true); });
+                    btns.appendChild(a);
+                }
+                btns.appendChild(mkBtn('REJECT', async () => { await decideFromBlotter(item.proposal_id, false); }));
+                D.pendingList.appendChild(row);
+            });
+        }
+    } catch (_) { D.pendingList.innerHTML = '<div class="hub-empty">Pending queue unreachable.</div>'; }
+
+    // open positions
+    try {
+        const j = await (await fetch('/trades')).json();
+        const p = j.positions || [];
+        D.openCount.textContent = p.length;
+        if (!p.length) D.blotterOpen.innerHTML = '<div class="hub-empty">No open positions.</div>';
+        else {
+            const t = document.createElement('table');
+            t.className = 'mini-table';
+            t.innerHTML = '<thead><tr><th>SYMBOL</th><th>SIDE</th><th>SIZE</th><th>ENTRY</th><th>OPENED</th><th></th></tr></thead>';
+            const tb = document.createElement('tbody');
+            p.forEach(x => {
+                const tr = document.createElement('tr');
+                tr.innerHTML =
+                    `<td>${esc(x.symbol)}</td><td>${esc(x.direction || '')}</td>` +
+                    `<td>${x.size}</td><td>${x.entry_price}</td>` +
+                    `<td>${esc(String(x.opened_at || '').slice(0, 19))}</td><td></td>`;
+                tr.lastElementChild.appendChild(mkBtn('CLOSE', async () => {
+                    if (!confirm(`Close ${x.symbol} ${x.direction} ${x.size} at market?`)) return;
+                    try {
+                        const r = await fetch('/trade/close', {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ position_id: x.id }),
+                        });
+                        const jj = await r.json();
+                        if (jj.ok) loadBlotter();
+                        else alert(jj.detail || 'Close failed.');
+                    } catch (e) { alert('Close failed: ' + e.message); }
+                }));
+                tb.appendChild(tr);
+            });
+            t.appendChild(tb);
+            D.blotterOpen.innerHTML = '';
+            D.blotterOpen.appendChild(t);
+        }
+    } catch (_) { D.blotterOpen.innerHTML = '<div class="hub-empty">Book unreachable.</div>'; }
+
+    // execution log
+    try {
+        const j = await (await fetch('/audit?limit=40')).json();
+        const want = ['trade_proposed','risk_assessment','trade_approved','trade_rejected',
+                      'trade_executed','trade_executed_LIVE','position_closed',
+                      'kill_switch_activated','kill_switch'];
+        const rec = (j.records || []).filter(x => want.includes(x.action_type)).slice(0, 18);
+        if (!rec.length) D.execLog.innerHTML = '<div class="hub-empty">No execution events yet.</div>';
+        else D.execLog.innerHTML = rec.map(x =>
+            `<div class="audit-row"><span class="a-ts">${esc(String(x.timestamp||'').slice(11,19))}</span>` +
+            `<span class="a-kind">${esc(x.action_type||'')}</span>` +
+            `<span class="a-det">${esc(x.detail||'')}</span></div>`).join('');
+    } catch (_) { D.execLog.innerHTML = '<div class="hub-empty">Audit unreachable.</div>'; }
+}
+
+function mkBtn(label, fn) {
+    const b = document.createElement('button');
+    b.className = 'inline-btn';
+    b.textContent = label;
+    b.onclick = fn;
+    return b;
+}
+
+async function decideFromBlotter(pid, approve) {
+    try {
+        const r = await fetch('/trade/decide', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ proposal_id: pid, approve }),
+        });
+        const j = await r.json();
+        if (approve && !j.executed) alert(j.detail || j.status || 'Execution did not complete.');
+    } catch (e) { alert('Decision failed: ' + e.message); }
+    loadBlotter();
 }
 
 /* ── AGENTS: roster ── */

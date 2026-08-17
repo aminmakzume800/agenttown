@@ -79,3 +79,75 @@ def run_all_checks(size: float, risk_amount: float) -> tuple[bool, list[str]]:
             all_passed = False
     
     return all_passed, messages
+
+
+# ── Correlated exposure ─────────────────────────────────────
+# Instruments that tend to move together. Opening same-direction risk across a
+# group multiplies drawdown, so the group is capped as one bucket.
+CORRELATION_GROUPS = [
+    {"EUR/USD", "GBP/USD"},   # both USD-quoted majors
+]
+
+
+def check_correlation(symbol: str, side: str) -> tuple[bool, str]:
+    """Reject a new position that stacks same-direction correlated exposure."""
+    group = next((g for g in CORRELATION_GROUPS if symbol in g), None)
+    if not group:
+        return True, "No correlated exposure for this symbol."
+
+    peers = [
+        p for p in get_open_positions()
+        if p.get("symbol") in group
+        and p.get("symbol") != symbol
+        and str(p.get("direction", "")).lower() == side.lower()
+    ]
+    if peers:
+        names = ", ".join(sorted({p["symbol"] for p in peers}))
+        return False, f"Correlated exposure: already {side} on {names}."
+    return True, "Correlated exposure OK."
+
+
+def check_symbol_exposure(symbol: str, size: float) -> tuple[bool, str]:
+    """Cap total lots per symbol at the configured max position size."""
+    held = sum(
+        float(p.get("size", 0))
+        for p in get_open_positions()
+        if p.get("symbol") == symbol
+    )
+    total = held + size
+    if total > settings.MAX_POSITION_SIZE:
+        return False, (
+            f"{symbol} exposure {total:.2f} lots exceeds max "
+            f"{settings.MAX_POSITION_SIZE:.2f} (already holding {held:.2f})."
+        )
+    return True, f"{symbol} exposure {total:.2f}/{settings.MAX_POSITION_SIZE:.2f} lots OK."
+
+
+def evaluate_order(order: dict) -> tuple[bool, list[str]]:
+    """Run every gate against a parsed order.
+
+    Args:
+        order: dict from proposal.parse_proposal — needs symbol, side, size,
+               risk_usd.
+
+    Returns:
+        (approved, checks) where checks is a list of "✓ …" / "✗ …" lines.
+        Approved is True only when every gate passes.
+    """
+    symbol = order.get("symbol", "")
+    side = order.get("side", "buy")
+    size = float(order.get("size", 0) or 0)
+    risk = float(order.get("risk_usd", 0) or 0)
+
+    results = [
+        check_position_size(size),
+        check_daily_drawdown(risk),
+        check_max_trades(),
+        check_symbol_exposure(symbol, size),
+        check_correlation(symbol, side),
+        check_news_blackout(),
+    ]
+
+    approved = all(passed for passed, _ in results)
+    checks = [("✓ " if passed else "✗ ") + reason for passed, reason in results]
+    return approved, checks

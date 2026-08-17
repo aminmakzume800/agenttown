@@ -60,6 +60,7 @@
             <button class="tab active" data-tab="town">AGENT TOWN</button>
             <button class="tab" data-tab="agents">AGENTS</button>
             <button class="tab" data-tab="visual">VISUAL HUB</button>
+            <button class="tab" data-tab="blotter">BLOTTER</button>
             <button class="tab" data-tab="gesture">GESTURE</button>
         </div>
         <div class="tab-meta" id="busyMeta">0/8 busy</div>
@@ -161,6 +162,33 @@
                 </div>
             </div>
 
+            <!-- VIEW: BLOTTER -->
+            <div class="view" id="view-blotter">
+                <div class="floor-hint">
+                    <span>EXECUTION BLOTTER</span>
+                    <span class="sep">|</span>
+                    <span id="blotterMode">paper</span>
+                    <span class="sep">|</span>
+                    <button class="inline-btn" id="refreshBlotter">REFRESH</button>
+                </div>
+                <div class="view-body">
+                    <div class="hub-grid">
+                        <div class="hub-card wide">
+                            <div class="hub-title">AWAITING MANAGER DECISION <span class="hub-sub" id="pendCount">0</span></div>
+                            <div id="pendingList"><div class="hub-empty">No proposals awaiting decision.</div></div>
+                        </div>
+                        <div class="hub-card wide">
+                            <div class="hub-title">OPEN POSITIONS <span class="hub-sub" id="openCount">0</span></div>
+                            <div id="blotterOpen"><div class="hub-empty">No open positions.</div></div>
+                        </div>
+                        <div class="hub-card wide">
+                            <div class="hub-title">EXECUTION LOG <span class="hub-sub">proposals · risk verdicts · fills</span></div>
+                            <div id="execLog"><div class="hub-empty">No execution events yet.</div></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- VIEW: GESTURE -->
             <div class="view" id="view-gesture">
                 <div class="floor-hint">
@@ -204,6 +232,7 @@
                     <h3 class="ap-channel-title">CHAT</h3>
                     <div class="ap-channel-actions">
                         <button class="mini-btn" id="voiceBtn">VOICE ON</button>
+                        <button class="mini-btn" id="clearBtn">CLEAR</button>
                         <button class="mini-btn danger" id="terminateBtn">TERMINATE</button>
                     </div>
                 </div>

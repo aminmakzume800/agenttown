@@ -415,6 +415,84 @@ kbd {
 .audit-row .a-kind { color: var(--cyan-dim); }
 .audit-row .a-det  { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* ── PROPOSAL CARD ── */
+.prop-card {
+    align-self: stretch;
+    border: 1px solid var(--cyan-dim);
+    background: #08161a;
+    padding: 9px 11px;
+    animation: bubbleIn .22s ease-out;
+}
+.prop-card.vetoed { border-color: var(--red); background: #180d0c; }
+
+.prop-head {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 8.5px; letter-spacing: 1.4px;
+    color: var(--cyan-dim);
+    text-transform: uppercase;
+    padding-bottom: 6px; margin-bottom: 7px;
+    border-bottom: 1px solid var(--line-soft);
+}
+.prop-card.vetoed .prop-head { color: var(--red); }
+.prop-verdict { font-size: 8px; padding: 2px 6px; border: 1px solid currentColor; }
+
+.prop-line {
+    font-family: var(--pixel);
+    font-size: 17px; letter-spacing: .5px;
+    color: var(--text);
+    margin-bottom: 6px;
+}
+.prop-line .side-buy  { color: var(--green); }
+.prop-line .side-sell { color: var(--red); }
+
+.prop-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 5px; margin-bottom: 7px;
+}
+.prop-cell { border: 1px solid var(--line-soft); padding: 4px 6px; }
+.prop-cell .k { font-size: 7.5px; letter-spacing: 1px; color: var(--text-faint); text-transform: uppercase; }
+.prop-cell .v { font-size: 11px; color: var(--text); margin-top: 1px; }
+
+.prop-checks { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
+.prop-check { font-size: 9px; line-height: 1.45; }
+.prop-check.pass { color: var(--text-dim); }
+.prop-check.fail { color: var(--red); }
+
+.prop-actions { display: flex; gap: 6px; }
+.prop-btn {
+    flex: 1;
+    font-family: var(--mono);
+    font-size: 9px; letter-spacing: 1.2px;
+    padding: 6px;
+    background: #101820;
+    border: 1px solid var(--line);
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all .15s;
+}
+.prop-btn.approve:hover { color: var(--green); border-color: var(--green); background: rgba(67,201,107,.1); }
+.prop-btn.reject:hover  { color: var(--red);   border-color: var(--red);   background: rgba(226,84,74,.1); }
+.prop-btn:disabled { opacity: .35; cursor: not-allowed; }
+
+.prop-result {
+    font-size: 9.5px; letter-spacing: .5px;
+    padding: 5px 0 1px;
+}
+.prop-result.ok   { color: var(--green); }
+.prop-result.bad  { color: var(--red); }
+
+/* ── BLOTTER ── */
+.pend-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    gap: 10px; align-items: center;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--line-soft);
+}
+.pend-desc { font-size: 10.5px; color: var(--text); }
+.pend-meta { font-size: 9px; color: var(--text-faint); margin-top: 2px; }
+.pend-btns { display: flex; gap: 5px; }
+
 /* ── GESTURE ── */
 .gesture-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(212px, 1fr)); gap: 10px; }
 .gesture-card {
