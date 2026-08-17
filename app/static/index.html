@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent Town — Trading System</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Top Bar -->
+        <div class="topbar">
+            <button class="kill-switch-btn" id="killSwitchBtn">⛔ KILL SWITCH</button>
+            <span class="mode-badge paper" id="modeBadge">PAPER</span>
+            <select class="lang-toggle" id="langToggle">
+                <option value="en">English</option>
+                <option value="bn">বাংলা</option>
+            </select>
+        </div>
+
+        <h1 class="page-title" id="pageTitle">Agent Town — Trading System</h1>
+
+        <!-- Agent Grid -->
+        <div class="agent-grid" id="agentGrid">
+            <!-- Cards rendered by JS -->
+        </div>
+
+        <!-- Chat Panel (hidden by default) -->
+        <div class="chat-panel hidden" id="chatPanel">
+            <div class="chat-header">
+                <span class="chat-agent-name" id="chatAgentName">Agent</span>
+                <button class="terminate-btn" id="terminateBtn">🛑 Terminate</button>
+            </div>
+            <div class="chat-messages" id="chatMessages"></div>
+            <div class="chat-input">
+                <button class="mic-btn" id="micBtn">🎤</button>
+                <input type="text" id="chatInput" placeholder="Type a message..." autocomplete="off">
+                <button class="send-btn" id="sendBtn">Send</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
