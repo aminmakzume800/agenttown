@@ -61,6 +61,7 @@
             <button class="tab" data-tab="agents">AGENTS</button>
             <button class="tab" data-tab="visual">VISUAL HUB</button>
             <button class="tab" data-tab="blotter">BLOTTER</button>
+            <button class="tab" data-tab="autopilot">AUTOPILOT</button>
             <button class="tab" data-tab="gesture">GESTURE</button>
         </div>
         <div class="tab-meta" id="busyMeta">0/8 busy</div>
@@ -184,6 +185,82 @@
                         <div class="hub-card wide">
                             <div class="hub-title">EXECUTION LOG <span class="hub-sub">proposals · risk verdicts · fills</span></div>
                             <div id="execLog"><div class="hub-empty">No execution events yet.</div></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- VIEW: AUTOPILOT -->
+            <div class="view" id="view-autopilot">
+                <div class="floor-hint">
+                    <span>AUTOPILOT</span>
+                    <span class="sep">|</span>
+                    <span id="apilotState">stopped</span>
+                    <span class="sep">|</span>
+                    <button class="inline-btn" id="apilotToggle">START</button>
+                    <span class="sep">|</span>
+                    <button class="inline-btn" id="apilotRefresh">REFRESH</button>
+                </div>
+                <div class="view-body">
+                    <div class="hub-grid">
+                        <div class="hub-card wide">
+                            <div class="hub-title">
+                                BROKER CONNECTION
+                                <span class="hub-sub">Trading.com / any MT5 broker · via MetaApi</span>
+                            </div>
+                            <form id="brokerForm" class="broker-form" autocomplete="off">
+                                <label>Execution mode
+                                    <select id="bkMode" class="mini-select">
+                                        <option value="paper">paper — simulated locally</option>
+                                        <option value="broker">broker — real MT5 account (any OS)</option>
+                                        <option value="live">live — local MT5 terminal (Windows)</option>
+                                    </select>
+                                </label>
+                                <label>MetaApi token
+                                    <input id="bkToken" type="password" placeholder="paste token — leave blank to keep saved one">
+                                </label>
+                                <label>Account ID
+                                    <input id="bkAccount" type="text" placeholder="MetaApi account UUID">
+                                </label>
+                                <label>Region
+                                    <input id="bkRegion" type="text" placeholder="london" value="london">
+                                </label>
+                                <label class="broker-check">
+                                    <input id="bkEnabled" type="checkbox">
+                                    <span>Allow real orders (leave off until connection is confirmed)</span>
+                                </label>
+                                <div class="broker-btns">
+                                    <button type="button" class="inline-btn" id="bkSave">SAVE &amp; TEST</button>
+                                    <span class="broker-hint" id="bkHint">Get these free at app.metaapi.cloud</span>
+                                </div>
+                            </form>
+                        </div>
+
+                        <div class="hub-card wide">
+                            <div class="hub-title">
+                                ORDER DESTINATION
+                                <span class="hub-sub" id="apilotDest">checking…</span>
+                            </div>
+                            <div id="brokerPanel"><div class="hub-empty">Loading…</div></div>
+                        </div>
+                        <div class="hub-card">
+                            <div class="hub-title">LOOP</div>
+                            <div class="stat-rows" id="apilotStats">
+                                <div class="hub-empty">Loading…</div>
+                            </div>
+                        </div>
+                        <div class="hub-card">
+                            <div class="hub-title">GUARDRAILS</div>
+                            <div class="stat-rows" id="apilotGuards">
+                                <div class="hub-empty">Loading…</div>
+                            </div>
+                        </div>
+                        <div class="hub-card wide">
+                            <div class="hub-title">
+                                ACTIVITY
+                                <span class="hub-sub">scans · vetoes · fills · halts</span>
+                            </div>
+                            <div id="apilotFeed"><div class="hub-empty">Nothing yet. Start the autopilot to see it work.</div></div>
                         </div>
                     </div>
                 </div>

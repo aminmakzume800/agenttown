@@ -12,3 +12,4 @@ data/
 venv/
 .venv/
 .kiro/
+*.log

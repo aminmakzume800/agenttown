@@ -44,7 +44,12 @@ def init_db() -> None:
                 closed_at TEXT,
                 exit_price REAL,
                 pnl REAL,
-                status TEXT NOT NULL DEFAULT 'open'
+                status TEXT NOT NULL DEFAULT 'open',
+                stop_loss REAL DEFAULT 0,
+                take_profit REAL DEFAULT 0,
+                opened_by TEXT DEFAULT 'user',
+                broker_position_id TEXT,
+                broker_symbol TEXT
             );
 
             CREATE TABLE IF NOT EXISTS agents (
@@ -61,10 +66,31 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_positions_agent ON positions(agent_key);
         """)
         conn.commit()
+        _migrate_positions(conn)
     finally:
         conn.close()
 
     ensure_demo_agents()
+
+
+def _migrate_positions(conn: sqlite3.Connection) -> None:
+    """Add columns that older databases predate.
+
+    Stops used to live only in the audit metadata, which meant nothing could
+    manage an exit. They are part of the position row now, so an existing
+    data/app.db is upgraded in place rather than needing a wipe.
+    """
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(positions)")}
+    for column, ddl in (
+        ("stop_loss", "ALTER TABLE positions ADD COLUMN stop_loss REAL DEFAULT 0"),
+        ("take_profit", "ALTER TABLE positions ADD COLUMN take_profit REAL DEFAULT 0"),
+        ("opened_by", "ALTER TABLE positions ADD COLUMN opened_by TEXT DEFAULT 'user'"),
+        ("broker_position_id", "ALTER TABLE positions ADD COLUMN broker_position_id TEXT"),
+        ("broker_symbol", "ALTER TABLE positions ADD COLUMN broker_symbol TEXT"),
+    ):
+        if column not in have:
+            conn.execute(ddl)
+    conn.commit()
 
 
 def log_event(agent_key: str, action_type: str, detail: str = "", metadata: str = "") -> None:
@@ -160,20 +186,54 @@ def insert_position(
     direction: str,
     size: float,
     entry_price: float,
+    stop_loss: float = 0.0,
+    take_profit: float = 0.0,
+    opened_by: str = "user",
+    broker_position_id: str | None = None,
+    broker_symbol: str | None = None,
 ) -> str:
-    """Record a new trade position. Returns the position ID."""
+    """Record a new trade position. Returns the local position ID.
+
+    stop_loss / take_profit are stored on the row so the exit can be enforced
+    later without the original proposal being in memory. opened_by is 'user' or
+    'autopilot' and is what lets the UI and audit tell the two apart.
+
+    broker_position_id is the broker's own ticket when the fill was real. It is
+    the link that lets the local book be reconciled against the account, and it
+    is None for paper fills.
+    """
     position_id = str(uuid4())
     conn = _get_conn()
     try:
         conn.execute(
-            """INSERT INTO positions (id, agent_key, symbol, direction, size, entry_price, opened_at, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'open')""",
-            (position_id, agent_key, symbol, direction, size, entry_price, datetime.utcnow().isoformat()),
+            """INSERT INTO positions
+                 (id, agent_key, symbol, direction, size, entry_price, opened_at,
+                  status, stop_loss, take_profit, opened_by,
+                  broker_position_id, broker_symbol)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
+            (
+                position_id, agent_key, symbol, direction, size, entry_price,
+                datetime.utcnow().isoformat(), stop_loss, take_profit, opened_by,
+                broker_position_id, broker_symbol,
+            ),
         )
         conn.commit()
     finally:
         conn.close()
     return position_id
+
+
+def get_position_by_broker_id(broker_position_id: str) -> dict | None:
+    """Find the local row that mirrors a given broker ticket."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM positions WHERE broker_position_id = ? AND status = 'open'",
+            (str(broker_position_id),),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
 
 def get_open_positions() -> list[dict]:
@@ -203,6 +263,28 @@ def close_position(position_id: str, exit_price: float, pnl: float) -> bool:
         conn.close()
 
 
+def realised_pnl(
+    symbol: str,
+    direction: str,
+    size: float,
+    entry_price: float,
+    exit_price: float,
+) -> float:
+    """USD profit or loss for a closed position.
+
+    One definition used everywhere — the kill switch, the manual close and the
+    autopilot all price an exit the same way. Applies the instrument's contract
+    size, and treats sell/short as the inverse of buy/long.
+    """
+    from app.trading.proposal import CONTRACT_SIZE
+
+    mult = CONTRACT_SIZE.get(symbol, 100_000)
+    diff = float(exit_price) - float(entry_price)
+    if str(direction or "").lower() in ("sell", "short"):
+        diff = -diff
+    return round(diff * mult * float(size), 2)
+
+
 def close_all_positions(exit_price_map: dict[str, float] | None = None) -> int:
     """Kill switch: close all open positions. Returns count of positions closed.
 
@@ -214,7 +296,7 @@ def close_all_positions(exit_price_map: dict[str, float] | None = None) -> int:
     try:
         now = datetime.utcnow().isoformat()
         open_positions = conn.execute(
-            "SELECT id, entry_price, direction, size FROM positions WHERE status = 'open'"
+            "SELECT id, entry_price, direction, size, symbol FROM positions WHERE status = 'open'"
         ).fetchall()
 
         closed_count = 0
@@ -224,12 +306,13 @@ def close_all_positions(exit_price_map: dict[str, float] | None = None) -> int:
 
             if exit_price_map and pos_id in exit_price_map:
                 exit_price = exit_price_map[pos_id]
-                direction = pos["direction"]
-                size = pos["size"]
-                if direction == "long":
-                    pnl = (exit_price - entry_price) * size
-                else:
-                    pnl = (entry_price - exit_price) * size
+                pnl = realised_pnl(
+                    symbol=pos["symbol"],
+                    direction=pos["direction"],
+                    size=pos["size"],
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                )
             else:
                 exit_price = entry_price
                 pnl = 0.0

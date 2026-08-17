@@ -13,20 +13,39 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 # Model assignment, verified working on the free NVIDIA tier.
 #
-# Measured latency on this key:
-#   nemotron-3-nano-30b-a3b       ~1.0 s   fastest
-#   nemotron-3-super-120b-a12b    ~1.7 s   best reasoning per second
-#   nemotron-3.5-lightning-30b    ~1.8 s
-#   nemotron-3-ultra-550b-a55b    ~5.0 s   deepest, worth it for analysis
+# Measured on this key, with reasoning traces DISABLED (see THINKING_OFF):
+#   nemotron-3-nano-30b-a3b       ~1.1 s   fastest, clean structured output
+#   nemotron-3.5-lightning-30b    ~1.6 s
+#   nemotron-3-super-120b-a12b    ~4.7 s   best reasoning per second
+#   nemotron-3-ultra-550b-a55b    ~7 s     deepest, worth it for analysis
+#   meta/llama-3.1-8b-instruct    ~0.7 s   needs no thinking flag at all
+#   meta/llama-3.1-70b-instruct   ~5.5 s   solid, always well-formed
 #
-# Checked and NOT usable on this tier (404 or multi-minute timeouts):
-#   writer/palmyra-fin-70b-32k, moonshotai/kimi-k2.6,
-#   mistralai/codestral-22b, deepseek-v4-flash-0731,
-#   openai/gpt-oss-120b, z-ai/glm-5.2
+# The same models with thinking left ON took 5-12 s and spent most of the
+# budget narrating their own scratchpad, so the flag is not optional.
+#
+# Checked and NOT usable on this tier (404 / 410 end-of-life / timeout):
+#   writer/palmyra-fin-70b-32k (finance specialist, would be ideal),
+#   deepseek-ai/deepseek-r1, deepseek-ai/deepseek-v3.1,
+#   mistralai/mistral-small-24b-instruct, qwen/qwen2.5-7b-instruct,
+#   qwen/qwen3-next-80b-a3b-instruct, microsoft/phi-4-mini-instruct,
+#   google/gemma-3-27b-it, openai/gpt-oss-120b, meta/llama-3.3-70b-instruct
 SUPER = "nvidia/nemotron-3-super-120b-a12b"
 ULTRA = "nvidia/nemotron-3-ultra-550b-a55b"
 NANO = "nvidia/nemotron-3-nano-30b-a3b"
 LIGHTNING = "nvidia/nemotron-3.5-lightning-30b-a3b"
+LLAMA_8B = "meta/llama-3.1-8b-instruct"
+LLAMA_70B = "meta/llama-3.1-70b-instruct"
+
+# Nemotron narrates its reasoning by default. This switch turns that off at the
+# chat template, which is far more reliable than stripping it afterwards.
+# Models that do not understand the flag ignore it; if one rejects the request
+# outright, chat_completion retries without it.
+THINKING_OFF = {"chat_template_kwargs": {"thinking": False}}
+
+# Tried in order when the primary model fails. Both are quick and never emit a
+# scratchpad, so an outage degrades latency and depth rather than the feature.
+FALLBACK_CHAIN = [LLAMA_8B, NANO]
 
 AGENT_MODEL_MAP: dict[str, tuple[str, str]] = {
     # Decisions that gate money get the strongest reasoning model.
@@ -110,12 +129,47 @@ def strip_reasoning(text: Optional[str]) -> Optional[str]:
     return out or text
 
 
+def _one_call(
+    client: OpenAI,
+    model: str,
+    messages: list[dict],
+    max_tokens: Optional[int],
+    temperature: float,
+    thinking: bool,
+) -> Optional[str]:
+    """Single completion attempt. Retries once without the thinking flag."""
+    kwargs: dict = {"model": model, "messages": messages, "temperature": temperature}
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
+
+    for extra in ({} if thinking else THINKING_OFF, None):
+        if extra is None:
+            # Second pass: drop the flag entirely in case the model rejected it.
+            kwargs.pop("extra_body", None)
+        elif extra:
+            kwargs["extra_body"] = extra
+
+        try:
+            response = client.chat.completions.create(**kwargs)
+            return strip_reasoning(response.choices[0].message.content)
+        except Exception as exc:
+            logger.warning("LLM call failed (model=%s): %s", model, exc)
+            if "extra_body" not in kwargs:
+                return None  # already the plain attempt, nothing left to vary
+
+    return None
+
+
 def chat_completion(
     provider: str,
     model: str,
     system_prompt: str,
     user_message: str,
     history: list[dict] | None = None,
+    max_tokens: Optional[int] = None,
+    temperature: float = 0.7,
+    thinking: bool = False,
+    fallback: bool = True,
 ) -> Optional[str]:
     """Call the LLM and return the assistant message content.
 
@@ -124,10 +178,15 @@ def chat_completion(
         model: Model identifier (e.g. "nvidia/nemotron-3-nano-30b-a3b")
         system_prompt: System-level instruction
         user_message: User-level prompt
-        history: Optional conversation history [{"role":"user","content":"..."}, ...]
+        history: Optional conversation history [{"role":"user","content":"..."}]
+        max_tokens: Optional output cap
+        temperature: Sampling temperature; keep low for trade plans
+        thinking: Leave the model's reasoning trace on. Off by default because
+            it is 3-10x slower and leaks the scratchpad into the reply.
+        fallback: Try FALLBACK_CHAIN if the requested model fails
 
     Returns:
-        The assistant's reply as a string, or None if both attempts fail.
+        The assistant's reply as a string, or None if every attempt fails.
     """
     client = get_client()
     if client is None:
@@ -139,20 +198,13 @@ def chat_completion(
         messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
-    for attempt in range(2):  # retry once on failure
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-            )
-            return strip_reasoning(response.choices[0].message.content)
-        except Exception as exc:
-            logger.warning(
-                "LLM call failed (model=%s, attempt=%d/2): %s",
-                model,
-                attempt + 1,
-                exc,
-            )
+    tried = [model] + ([m for m in FALLBACK_CHAIN if m != model] if fallback else [])
+    for candidate in tried:
+        result = _one_call(client, candidate, messages, max_tokens, temperature, thinking)
+        if result:
+            if candidate != model:
+                logger.warning("Model %s unavailable, served by %s", model, candidate)
+            return result
 
-    logger.error("Both attempts failed for model=%s", model)
+    logger.error("All models failed (requested=%s)", model)
     return None

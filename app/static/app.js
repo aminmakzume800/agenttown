@@ -75,7 +75,10 @@ const D = {};
  'sysProfileTitle','sysProfileDesc','rosterBody','tickers','acctStats','btSymbol','btTf',
  'runBt','btResult','positions','auditList','gestureGrid','gestureTarget','refreshHub',
  'blotterMode','pendCount','pendingList','openCount','blotterOpen','execLog','refreshBlotter',
- 'clearBtn','convoBtn'
+ 'clearBtn','convoBtn',
+ 'apilotState','apilotToggle','apilotRefresh','apilotDest','brokerPanel','apilotStats',
+ 'apilotGuards','apilotFeed',
+ 'bkMode','bkToken','bkAccount','bkRegion','bkEnabled','bkSave','bkHint'
 ].forEach(id => D[id] = document.getElementById(id));
 
 const ctx  = D.officeCanvas.getContext('2d');
@@ -93,6 +96,9 @@ function init() {
     initTTS();
     loadAgents();
     connectWS();
+    // Header self-heals: re-read status every 20s so the mode badge stays
+    // right even if the broker config changed in another tab or via .env.
+    setInterval(refreshStatus, 20000);
     requestAnimationFrame(loop);
 }
 
@@ -138,6 +144,11 @@ function bindUI() {
     D.refreshHub.onclick = loadHub;
     D.runBt.onclick = runBacktest;
     D.refreshBlotter.onclick = loadBlotter;
+    D.apilotRefresh.onclick = loadAutopilot;
+    D.apilotToggle.onclick = toggleAutopilot;
+    D.bkSave.onclick = saveBrokerConfig;
+    ['bkMode','bkToken','bkAccount','bkRegion','bkEnabled'].forEach(id =>
+        D[id].addEventListener('input', () => { window.brokerFormDirty = true; }));
 
     addEventListener('keydown', e => {
         const k = e.key.toLowerCase();
@@ -167,15 +178,27 @@ async function loadAgents() {
         updateBusy();
         if (curTab === 'agents') renderRoster();
     } catch (e) { console.error('[agents]', e); }
-    fetch('/status').then(r => r.json()).then(j => {
+    refreshStatus();
+}
+
+/* Pull /status and repaint the header badge + orb.
+   Called on load, after a broker/mode change, and on a slow poll, so the
+   header reflects the real execution mode without a hard refresh. */
+async function refreshStatus() {
+    try {
+        const j = await (await fetch('/status')).json();
         if (!j.ok) return;
-        const live = j.trading_mode === 'live';
         S.mode = j.trading_mode || 'paper';
-        D.modeBadge.textContent = live ? 'LIVE MODE' : 'LOCAL DEMO';
-        D.modeBadge.classList.toggle('live', live);
-        D.orbSub.textContent = live ? 'LIVE' : 'SIMULATED';
-        if (j.kill_switch_active) applyKill(true);
-    }).catch(() => {});
+        S.exec = j.execution || {};
+        // The badge answers one question: can this send a real order?
+        const real = !!S.exec.uses_real_money;
+        D.modeBadge.textContent = real
+            ? (S.mode === 'broker' ? 'BROKER — REAL ORDERS' : 'LIVE MODE')
+            : 'LOCAL DEMO';
+        D.modeBadge.classList.toggle('live', real);
+        D.orbSub.textContent = real ? 'LIVE' : 'SIMULATED';
+        if (j.kill_switch_active && !S.kill) applyKill(true);
+    } catch (_) {}
 }
 
 function updateBusy() {
@@ -415,6 +438,14 @@ function proposalCard(p) {
             return `<div class="prop-check ${fail ? 'fail' : 'pass'}">${esc(c)}</div>`;
         }).join('') +
         `</div>` +
+        (ok && p.execution && p.execution.uses_real_money
+            ? `<div class="apilot-warn">Approving sends a real market order to
+               ${esc(p.execution.destination)}. It fills at the live price, which
+               may differ from ${o.entry_price}.</div>`
+            : '') +
+        (ok && p.execution && p.execution.warning
+            ? `<div class="apilot-warn">${esc(p.execution.warning)}</div>`
+            : '') +
         (ok
             ? `<div class="prop-actions">
                  <button class="prop-btn approve">APPROVE &amp; EXECUTE</button>
@@ -451,14 +482,17 @@ function proposalCard(p) {
             });
             const j = await r.json();
             if (!approve) return finish('bad', 'Rejected by manager. Nothing sent.');
-            if (r.status === 403) return finish('bad', j.detail || 'Execution blocked.');
+            if (r.status === 403 || r.status === 503) return finish('bad', j.detail || 'Execution blocked.');
             if (j.status === 'stale_risk') return finish('bad', 'Risk re-check failed at execution — order dropped.');
             if (j.executed) {
                 const id = j.result?.order_id || j.result?.position_id || '';
-                finish('ok', `Executed in ${String(j.mode).toUpperCase()} mode. Ref ${String(id).slice(0, 8)}`);
+                const fill = j.result?.entry_price;
+                const at = (fill && fill !== o.entry_price) ? ` Filled at ${fill}.` : '';
+                finish('ok', `Executed in ${String(j.mode).toUpperCase()} mode.${at} ` +
+                             `Ref ${String(id).slice(0, 8)}`);
                 if (curTab === 'blotter') loadBlotter();
             } else {
-                finish('bad', j.detail || 'Execution failed.');
+                finish('bad', j.error || j.detail || 'Execution failed.');
             }
         } catch (e) {
             finish('bad', 'Execution request failed: ' + e.message);
@@ -986,6 +1020,8 @@ function connectWS() {
                     updateBusy();
                 } else if (m.type === 'agent_status') {
                     setStatus(m.agent_key, m.status);
+                } else if (m.type === 'autopilot' && m.entry) {
+                    onAutopilotEvent(m.entry);
                 }
             } catch (_) {}
         };
@@ -1373,13 +1409,254 @@ function switchTab(tab) {
     if (tab === 'agents')  renderRoster();
     if (tab === 'visual')  loadHub();
     if (tab === 'blotter') loadBlotter();
+    if (tab === 'autopilot') loadAutopilot();
     if (tab === 'gesture') renderGestures();
     if (tab === 'town')    resize();
 }
 
+/* ══ AUTOPILOT ══════════════════════════════════════════════
+   Shows where orders go, whether the loop is running, what the
+   guardrails are set to, and everything it has done. The broker
+   card is deliberately blunt about real vs simulated money.
+   ═══════════════════════════════════════════════════════════ */
+let apilotRunning = false;
+
+function row(label, value, cls) {
+    return `<div class="stat-row"><span>${label}</span>` +
+           `<b class="${cls || ''}">${value}</b></div>`;
+}
+
+async function loadAutopilot() {
+    let st = null;
+    try {
+        const r = await fetch('/autopilot/status');
+        st = await r.json();
+    } catch (_) {
+        D.apilotStats.innerHTML = '<div class="hub-empty">Autopilot unreachable.</div>';
+        return;
+    }
+
+    apilotRunning = !!st.running;
+    D.apilotState.textContent = st.halted ? `HALTED — ${st.halt_reason}`
+                              : st.running ? 'running' : 'stopped';
+    D.apilotState.className = st.halted ? 'bad' : (st.running ? 'good' : '');
+    D.apilotToggle.textContent = st.running ? 'STOP' : 'START';
+    D.apilotToggle.classList.toggle('on', st.running);
+
+    const ex = st.execution || {};
+    D.apilotDest.textContent = (ex.mode || 'paper').toUpperCase();
+
+    const cfg = st.config || {};
+    D.apilotStats.innerHTML =
+        row('Cycles run', st.cycles ?? 0) +
+        row('Last scan', st.last_cycle_at ? shortTime(st.last_cycle_at) : '—') +
+        row('Next scan', st.next_cycle_at ? shortTime(st.next_cycle_at) : '—') +
+        row('Scan interval', `${cfg.AUTOPILOT_INTERVAL_SEC}s`) +
+        row('Market', st.market_open ? 'open' : 'closed', st.market_open ? 'good' : '') +
+        row('Session', st.session || '—') +
+        row('Fills this hour', `${st.fills_last_hour}/${cfg.AUTOPILOT_MAX_TRADES_PER_HOUR}`) +
+        row('Fills today', `${st.fills_today}/${cfg.AUTOPILOT_MAX_TRADES_PER_DAY}`) +
+        (st.last_error ? row('Last error', st.last_error, 'bad') : '');
+
+    D.apilotGuards.innerHTML =
+        row('On its own?', st.will_place_orders ? 'places orders' : 'asks first',
+            st.will_place_orders ? 'bad' : 'good') +
+        row('Max size', `${cfg.AUTOPILOT_MAX_SIZE} lots`) +
+        row('Min reward:risk', `${cfg.AUTOPILOT_MIN_RR}x`) +
+        row('Halt at loss', `$${cfg.AUTOPILOT_HALT_DRAWDOWN}`) +
+        row('Watching', (cfg.AUTOPILOT_SYMBOLS || []).join(', ')) +
+        row('Real-account unlock', cfg.AUTOPILOT_ALLOW_LIVE ? 'granted' : 'withheld',
+            cfg.AUTOPILOT_ALLOW_LIVE ? 'bad' : 'good') +
+        row('Overnight alerts', st.notifications ? 'Telegram on' : 'off',
+            st.notifications ? 'good' : '');
+
+    renderBrokerCard(ex);
+    renderApilotFeed();
+    loadBrokerForm();
+}
+
+/* Pre-fill the credential form from the saved (redacted) config. */
+async function loadBrokerForm() {
+    if (window.brokerFormDirty) return;   // don't clobber what the user is typing
+    try {
+        const c = await (await fetch('/broker/config')).json();
+        D.bkMode.value = c.mode || 'paper';
+        D.bkAccount.value = c.account_id || '';
+        D.bkRegion.value = c.region || 'london';
+        D.bkEnabled.checked = !!c.trading_enabled;
+        D.bkToken.placeholder = c.token_set
+            ? `saved (${c.token_hint}) — leave blank to keep it`
+            : 'paste MetaApi token';
+    } catch (_) {}
+}
+
+async function saveBrokerConfig() {
+    window.brokerFormDirty = false;
+    const body = {
+        mode: D.bkMode.value,
+        account_id: D.bkAccount.value.trim(),
+        region: D.bkRegion.value.trim(),
+        trading_enabled: D.bkEnabled.checked,
+    };
+    // Only send the token when the user actually typed one, so a blank field
+    // keeps the saved token instead of wiping it.
+    const tok = D.bkToken.value.trim();
+    if (tok) body.token = tok;
+
+    if (body.trading_enabled && body.mode === 'broker' && !tok) {
+        // fine — they may be reusing a saved token; the status check will tell.
+    }
+    D.bkSave.disabled = true;
+    D.bkHint.textContent = 'Saving and testing…';
+    try {
+        const r = await fetch('/broker/config', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const j = await r.json();
+        D.bkToken.value = '';   // never keep the secret in the field
+        const h = j.status || {};
+        if (body.mode !== 'broker') {
+            D.bkHint.textContent = 'Saved. Mode is ' + body.mode + ' — no broker needed.';
+        } else if (h.reachable) {
+            const acct = h.account || {};
+            D.bkHint.textContent = `Connected ✓  ${acct.login ?? ''} ` +
+                `${h.is_demo === false ? 'REAL' : 'demo'}  bal ${fmtMoney(acct.balance)}`;
+        } else {
+            D.bkHint.textContent = 'Saved, but not connected: ' + (h.error || 'check credentials');
+        }
+    } catch (e) {
+        D.bkHint.textContent = 'Save failed: ' + e.message;
+    } finally {
+        D.bkSave.disabled = false;
+        refreshStatus();   // repaint the header badge for the new mode
+        loadAutopilot();
+    }
+}
+
+async function renderBrokerCard(ex) {
+    let html = row('Mode', (ex.mode || 'paper').toUpperCase()) +
+               row('Orders go to', ex.destination || '—') +
+               row('Real money path', ex.uses_real_money ? 'YES' : 'no',
+                   ex.uses_real_money ? 'bad' : 'good');
+    if (ex.warning) html += `<div class="apilot-warn">${ex.warning}</div>`;
+
+    if (ex.mode === 'broker') {
+        try {
+            const r = await fetch('/broker/status');
+            const b = await r.json();
+            const acct = b.account || {};
+            html += row('Bridge', b.reachable ? 'connected' : 'not connected',
+                        b.reachable ? 'good' : 'bad');
+            if (b.deployment) {
+                html += row('Server', b.deployment.server || '—') +
+                        row('Terminal', b.deployment.connection_status || b.deployment.state || '—');
+            }
+            if (b.reachable) {
+                html += row('Account', `${acct.login ?? '—'} (${acct.currency ?? ''})`) +
+                        row('Account type', b.is_demo === true ? 'DEMO'
+                                          : b.is_demo === false ? 'REAL MONEY' : 'unknown',
+                            b.is_demo === false ? 'bad' : 'good') +
+                        row('Balance', fmtMoney(acct.balance)) +
+                        row('Equity', fmtMoney(acct.equity)) +
+                        row('Free margin', fmtMoney(acct.free_margin));
+                const syms = Object.entries(b.symbols || {})
+                    .map(([k, v]) => `${k}→${v || '?'}`).join('  ');
+                if (syms) html += row('Symbol mapping', syms);
+            }
+            if (b.error) html += `<div class="apilot-warn">${b.error}</div>`;
+        } catch (_) {
+            html += `<div class="apilot-warn">Could not read broker status.</div>`;
+        }
+    } else if (ex.mode === 'paper') {
+        html += `<div class="apilot-note">Nothing here reaches a broker. To trade a
+                 Trading.com demo account from any OS, set TRADING_MODE=broker and add
+                 your MetaApi token — see .env.example.</div>`;
+    }
+    D.brokerPanel.innerHTML = html;
+}
+
+function fmtMoney(v) {
+    return (v === null || v === undefined) ? '—' : Number(v).toFixed(2);
+}
+function shortTime(iso) {
+    try { return new Date(iso).toLocaleTimeString(); } catch (_) { return iso; }
+}
+
+async function toggleAutopilot() {
+    const starting = !apilotRunning;
+    if (starting) {
+        // Anything that can reach a real account gets an explicit confirmation.
+        let warn = 'Start the autopilot?\n\nIt will scan the markets on a timer.';
+        try {
+            const s = await (await fetch('/autopilot/status')).json();
+            warn += s.will_place_orders
+                ? `\n\nIt WILL PLACE ORDERS BY ITSELF via: ${s.execution?.destination}.`
+                : '\n\nIt will queue proposals for your approval and place nothing on its own.';
+        } catch (_) {}
+        if (!confirm(warn)) return;
+    }
+    D.apilotToggle.disabled = true;
+    try {
+        const r = await fetch(starting ? '/autopilot/start' : '/autopilot/stop', { method: 'POST' });
+        const j = await r.json();
+        if (!r.ok) alert(j.detail || 'Autopilot could not change state.');
+    } catch (e) {
+        alert('Autopilot request failed: ' + e.message);
+    } finally {
+        D.apilotToggle.disabled = false;
+        refreshStatus();
+        loadAutopilot();
+    }
+}
+
+let apilotFeed = [];
+
+async function renderApilotFeed() {
+    try {
+        const r = await fetch('/autopilot/log?limit=60');
+        const j = await r.json();
+        apilotFeed = j.entries || [];
+    } catch (_) {}
+    paintApilotFeed();
+}
+
+function paintApilotFeed() {
+    if (!apilotFeed.length) {
+        D.apilotFeed.innerHTML =
+            '<div class="hub-empty">Nothing yet. Start the autopilot to see it work.</div>';
+        return;
+    }
+    D.apilotFeed.innerHTML = apilotFeed.map(e => `
+        <div class="apilot-row ${e.level}">
+            <span class="apilot-at">${shortTime(e.at)}</span>
+            <span class="apilot-lvl">${e.level}</span>
+            <span class="apilot-msg">${escapeHtml(e.message)}</span>
+        </div>`).join('');
+}
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function onAutopilotEvent(entry) {
+    apilotFeed.unshift(entry);
+    if (apilotFeed.length > 60) apilotFeed.pop();
+    if (curTab === 'autopilot') { paintApilotFeed(); }
+    // A fill or a halt changes the book and the kill switch, so refresh those.
+    if (entry.level === 'trade' || entry.level === 'halt') {
+        if (curTab === 'blotter') loadBlotter();
+        if (curTab === 'autopilot') loadAutopilot();
+        if (entry.level === 'halt') applyKill(true);
+    }
+}
+
 /* ── BLOTTER ── */
 async function loadBlotter() {
-    D.blotterMode.textContent = S.kill ? 'KILL SWITCH ACTIVE' : (S.mode || 'paper');
+    D.blotterMode.textContent = S.kill
+        ? 'KILL SWITCH ACTIVE'
+        : `${S.mode || 'paper'} — ${(S.exec && S.exec.destination) || 'simulated locally'}`;
 
     // pending proposals
     try {
