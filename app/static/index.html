@@ -3,43 +3,226 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Agent Town — Trading System</title>
+    <title>Agent Town — Local Multi-Agent Demo</title>
     <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-    <div class="container">
-        <!-- Top Bar -->
-        <div class="topbar">
-            <button class="kill-switch-btn" id="killSwitchBtn">⛔ KILL SWITCH</button>
-            <span class="mode-badge paper" id="modeBadge">PAPER</span>
-            <select class="lang-toggle" id="langToggle">
+<div id="app">
+
+    <!-- ══ TOP HEADER ══ -->
+    <header class="top-header">
+        <div class="brand">
+            <div class="brand-kicker">LOCAL MULTI-AGENT DEMO</div>
+            <h1 class="brand-title">AGENT TOWN</h1>
+        </div>
+        <div class="header-controls">
+            <span class="badge-demo" id="modeBadge">LOCAL DEMO</span>
+            <span class="conn-status" id="wsStatus"><i class="dot"></i>Connecting locally.</span>
+            <select id="langToggle" class="lang-select">
                 <option value="en">English</option>
                 <option value="bn">বাংলা</option>
             </select>
         </div>
+    </header>
 
-        <h1 class="page-title" id="pageTitle">Agent Town — Trading System</h1>
+    <!-- ══ SYSTEM PANEL ══ -->
+    <section class="system-panel">
+        <nav class="sys-menu">
+            <button class="sys-menu-item active" data-panel="memory">[ MEMORY ]</button>
+            <button class="sys-menu-item" data-panel="skills">[ SKILLS ]</button>
+            <button class="sys-menu-item" data-panel="soul">[ SOUL ]</button>
+            <button class="sys-menu-item" data-panel="settings">[ SETTINGS ]</button>
+        </nav>
 
-        <!-- Agent Grid -->
-        <div class="agent-grid" id="agentGrid">
-            <!-- Cards rendered by JS -->
+        <div class="sys-visual">
+            <canvas id="netCanvas" width="260" height="120"></canvas>
+            <div class="orb-wrap">
+                <canvas id="orbCanvas" width="110" height="110"></canvas>
+                <div class="orb-label">
+                    <span class="orb-title">SYSTEM ACTIVE</span>
+                    <span class="orb-sub" id="orbSub">SIMULATED</span>
+                </div>
+            </div>
         </div>
 
-        <!-- Chat Panel (hidden by default) -->
-        <div class="chat-panel hidden" id="chatPanel">
-            <div class="chat-header">
-                <span class="chat-agent-name" id="chatAgentName">Agent</span>
-                <button class="terminate-btn" id="terminateBtn">🛑 Terminate</button>
-            </div>
-            <div class="chat-messages" id="chatMessages"></div>
-            <div class="chat-input">
-                <button class="mic-btn" id="micBtn">🎤</button>
-                <input type="text" id="chatInput" placeholder="Type a message..." autocomplete="off">
-                <button class="send-btn" id="sendBtn">Send</button>
-            </div>
+        <div class="sys-profile">
+            <div class="sys-profile-kicker">SELECTED AGENT PROFILE</div>
+            <h2 class="sys-profile-title" id="sysProfileTitle">Town Settings</h2>
+            <p class="sys-profile-desc" id="sysProfileDesc">
+                Runs locally through Docker at localhost:8000. Broker execution remains simulated.
+            </p>
         </div>
+    </section>
+
+    <!-- ══ TABS ══ -->
+    <nav class="tab-bar">
+        <div class="tabs">
+            <button class="tab active" data-tab="town">AGENT TOWN</button>
+            <button class="tab" data-tab="agents">AGENTS</button>
+            <button class="tab" data-tab="visual">VISUAL HUB</button>
+            <button class="tab" data-tab="gesture">GESTURE</button>
+        </div>
+        <div class="tab-meta" id="busyMeta">0/8 busy</div>
+    </nav>
+
+    <!-- ══ MAIN BODY ══ -->
+    <div class="body-grid">
+
+        <!-- ── LEFT: VIEWS ── -->
+        <section class="floor-panel" id="floorPanel">
+
+            <!-- VIEW: AGENT TOWN -->
+            <div class="view active" id="view-town">
+                <div class="floor-hint">
+                    <span class="online"><i class="dot"></i>Online</span>
+                    <span class="sep">|</span>
+                    <span>WASD / arrows to move</span>
+                    <span class="sep">|</span>
+                    <span><kbd>E</kbd> interact</span>
+                </div>
+                <div class="floor-stage">
+                    <canvas id="officeCanvas"></canvas>
+                    <div class="interact-tip" id="interactTip" hidden>
+                        <span id="interactName">Super Trader</span>
+                        <span class="press">PRESS E</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- VIEW: AGENTS -->
+            <div class="view" id="view-agents">
+                <div class="floor-hint">
+                    <span>AGENT ROSTER</span>
+                    <span class="sep">|</span>
+                    <span>click a row to make it active</span>
+                </div>
+                <div class="view-body">
+                    <table class="roster">
+                        <thead>
+                            <tr><th>AGENT</th><th>KEY</th><th>ROLE</th><th>MODEL</th><th>STATUS</th></tr>
+                        </thead>
+                        <tbody id="rosterBody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- VIEW: VISUAL HUB -->
+            <div class="view" id="view-visual">
+                <div class="floor-hint">
+                    <span>VISUAL HUB</span>
+                    <span class="sep">|</span>
+                    <span>live market + book</span>
+                    <span class="sep">|</span>
+                    <button class="inline-btn" id="refreshHub">REFRESH</button>
+                </div>
+                <div class="view-body">
+                    <div class="hub-grid">
+                        <div class="hub-card">
+                            <div class="hub-title">MARKET FEED</div>
+                            <div class="tickers" id="tickers">
+                                <div class="hub-empty">Loading prices…</div>
+                            </div>
+                        </div>
+                        <div class="hub-card">
+                            <div class="hub-title">ACCOUNT</div>
+                            <div class="stat-rows" id="acctStats">
+                                <div class="hub-empty">Loading…</div>
+                            </div>
+                        </div>
+                        <div class="hub-card wide">
+                            <div class="hub-title">
+                                BACKTEST
+                                <span class="hub-sub">
+                                    <select id="btSymbol" class="mini-select">
+                                        <option value="EURUSD">EUR/USD</option>
+                                        <option value="XAUUSD">XAU/USD</option>
+                                        <option value="GBPUSD">GBP/USD</option>
+                                        <option value="NAS100">NAS100</option>
+                                    </select>
+                                    <select id="btTf" class="mini-select">
+                                        <option value="1h">1H</option>
+                                        <option value="15m">15M</option>
+                                        <option value="1d">1D</option>
+                                    </select>
+                                    <button class="inline-btn" id="runBt">RUN</button>
+                                </span>
+                            </div>
+                            <div id="btResult"><div class="hub-empty">SMA crossover replay on real candles. Pick a market and run.</div></div>
+                        </div>
+                        <div class="hub-card wide">
+                            <div class="hub-title">OPEN POSITIONS</div>
+                            <div id="positions"><div class="hub-empty">No open positions.</div></div>
+                        </div>
+                        <div class="hub-card wide">
+                            <div class="hub-title">AUDIT TRAIL <span class="hub-sub">last 12 events</span></div>
+                            <div id="auditList"><div class="hub-empty">No events yet.</div></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- VIEW: GESTURE -->
+            <div class="view" id="view-gesture">
+                <div class="floor-hint">
+                    <span>GESTURE DECK</span>
+                    <span class="sep">|</span>
+                    <span id="gestureTarget">no active agent — press E on a desk first</span>
+                </div>
+                <div class="view-body">
+                    <div class="gesture-grid" id="gestureGrid"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── RIGHT: AGENT PANEL ── -->
+        <aside class="agent-panel">
+            <div class="ap-head">
+                <div class="ap-avatar"><canvas id="apAvatar" width="34" height="34"></canvas></div>
+                <div class="ap-ident">
+                    <div class="ap-kicker">ACTIVE AGENT</div>
+                    <div class="ap-name" id="apName">No agent</div>
+                    <div class="ap-role" id="apRole">walk up and press E</div>
+                </div>
+                <span class="ap-badge" id="apBadge">IDLE</span>
+            </div>
+
+            <div class="ap-tabs">
+                <button class="ap-tab active" data-aptab="memory">Memory</button>
+                <button class="ap-tab" data-aptab="skills">Skills</button>
+                <button class="ap-tab" data-aptab="soul">Soul</button>
+                <button class="ap-tab" data-aptab="settings">Settings</button>
+            </div>
+
+            <div class="ap-tabbody" id="apTabBody">
+                <span class="ap-label">Memory:</span>
+                <span id="apTabText">Select an agent in the town to inspect its memory.</span>
+            </div>
+
+            <div class="ap-channel">
+                <div class="ap-channel-kicker">CHANNEL</div>
+                <div class="ap-channel-row">
+                    <h3 class="ap-channel-title">CHAT</h3>
+                    <div class="ap-channel-actions">
+                        <button class="mini-btn" id="voiceBtn">VOICE ON</button>
+                        <button class="mini-btn danger" id="terminateBtn">TERMINATE</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="chat-log" id="chatLog">
+                <div class="chat-sys" id="chatSys">No agent connected. Approach a desk and press E.</div>
+            </div>
+
+            <div class="chat-input-row">
+                <button class="mic-btn" id="micBtn" title="Voice input">🎙</button>
+                <input id="chatInput" type="text" placeholder="Ask the active agent…" autocomplete="off" disabled>
+                <button class="send-btn" id="sendBtn" disabled>➤</button>
+            </div>
+
+            <button class="kill-bar" id="killBtn">⛔ KILL SWITCH — HALT ALL TRADING</button>
+        </aside>
     </div>
-
-    <script src="/static/app.js"></script>
+</div>
+<script src="/static/app.js"></script>
 </body>
 </html>
