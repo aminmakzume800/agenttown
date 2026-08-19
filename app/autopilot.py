@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -32,8 +33,8 @@ from app.db import (
     log_event,
     realised_pnl,
 )
-from app.llm_client import SUPER, AGENT_MODEL_MAP, chat_completion
-from app.market_data import get_candles, get_current_price
+from app.llm_client import chat_completion, model_for
+from app.market_data import get_candles, get_quote, quote_is_tradeable
 from app.trading.broker import BrokerError, broker, http_json
 from app.trading.execution import router as execution
 from app.trading.proposal import parse_proposal, risk_amount
@@ -90,6 +91,9 @@ class Autopilot:
         self.last_cycle_at: Optional[str] = None
         self.next_cycle_at: Optional[str] = None
         self.last_error: str = ""
+        # How long the last full cycle took. Surfaced because on short
+        # timeframes this number decides whether a trade is still valid.
+        self.last_cycle_sec: Optional[float] = None
 
         # Rolling activity feed for the UI. Bounded so a long night cannot
         # grow the process without limit.
@@ -149,8 +153,11 @@ class Autopilot:
             "halt_reason": self.halt_reason,
             "cycles": self.cycles,
             "last_cycle_at": self.last_cycle_at,
+            "last_cycle_sec": self.last_cycle_sec,
             "next_cycle_at": self.next_cycle_at,
             "last_error": self.last_error,
+            "style": settings.style_name(),
+            "style_profile": settings.style(),
             "fills_last_hour": len(self._recent_fills(hours=1)),
             "fills_today": len(self._recent_fills(hours=24)),
             "trading_mode": settings.TRADING_MODE,
@@ -245,6 +252,7 @@ class Autopilot:
         """The loop. Any single cycle may fail without taking the loop down."""
         try:
             while self.running:
+                began = time.monotonic()
                 try:
                     await self._cycle()
                 except asyncio.CancelledError:
@@ -252,6 +260,7 @@ class Autopilot:
                 except Exception as exc:
                     self.last_error = str(exc)[:300]
                     await self._emit("warn", f"Cycle failed: {self.last_error}")
+                self.last_cycle_sec = round(time.monotonic() - began, 2)
 
                 self.cycles += 1
                 self.last_cycle_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -381,20 +390,22 @@ class Autopilot:
         if not positions:
             return
 
-        prices: dict[str, float] = {}
+        quotes: dict[str, dict] = {}
         for symbol in {p["symbol"] for p in positions}:
-            tick = await asyncio.to_thread(get_current_price, symbol)
+            tick = await asyncio.to_thread(get_quote, symbol)
             if tick and tick.get("last"):
-                prices[symbol] = float(tick["last"])
+                quotes[symbol] = tick
 
         for pos in positions:
-            price = prices.get(pos["symbol"])
-            if price is None:
+            quote = quotes.get(pos["symbol"])
+            if quote is None:
                 continue
 
             sl = float(pos.get("stop_loss") or 0)
             tp = float(pos.get("take_profit") or 0)
             is_buy = str(pos.get("direction", "")).lower() in ("buy", "long")
+            # A long exits by selling into the bid; a short buys back at the ask.
+            price = float(quote["bid"] if is_buy else quote["ask"])
 
             hit = ""
             if sl > 0 and ((is_buy and price <= sl) or (not is_buy and price >= sl)):
@@ -461,45 +472,31 @@ class Autopilot:
 
     # ── idea generation ─────────────────────────────────────
 
-    @staticmethod
-    def _quote(symbol: str) -> Optional[dict]:
-        """Best available price for a symbol.
-
-        In broker mode the broker's own quote is used, because that is the price
-        an order will actually fill at; reasoning off a free data feed and then
-        trading somewhere else invites entries that are stale on arrival. Falls
-        back to the public feed if the bridge is unreachable.
-        """
-        if execution.is_broker and broker.is_configured:
-            try:
-                quote = broker.price(symbol)
-            except BrokerError:
-                quote = None
-            if quote:
-                return {
-                    "last": quote["last"],
-                    "high": None,
-                    "low": None,
-                    "open": None,
-                    "source": "broker",
-                }
-        tick = get_current_price(symbol)
-        if tick:
-            tick["source"] = "public"
-        return tick
-
     async def _ask_bot(self, symbol: str) -> Optional[dict]:
         """Poll one bot and return a parsed order, or None for no setup."""
-        tick = await asyncio.to_thread(self._quote, symbol)
+        # Quote and candles are independent, so they are fetched together rather
+        # than one after the other. On the path to a scalp decision every
+        # avoidable round trip is price movement.
+        tick, candles = await asyncio.gather(
+            asyncio.to_thread(get_quote, symbol),
+            asyncio.to_thread(get_candles, symbol),
+        )
         if not tick or not tick.get("last"):
             await self._emit("warn", f"No price for {symbol} — skipped")
             return None
 
-        candles = await asyncio.to_thread(get_candles, symbol, "1h", 12) or []
+        # A stale quote is not tradeable, and the limit tightens for scalping.
+        fresh, note = quote_is_tradeable(tick)
+        if not fresh:
+            await self._emit("warn", f"{symbol}: {note}")
+            return None
+
+        profile = settings.style()
+        candles = candles or []
         closes = " ".join(str(c["close"]) for c in candles[-8:])
 
         max_size = float(self.cfg("AUTOPILOT_MAX_SIZE"))
-        min_rr = float(self.cfg("AUTOPILOT_MIN_RR"))
+        min_rr = max(float(self.cfg("AUTOPILOT_MIN_RR")), float(profile["min_rr"]))
 
         session = ""
         if tick.get("high") and tick.get("low"):
@@ -509,14 +506,19 @@ class Autopilot:
             )
 
         prompt = (
-            f"{symbol} is {tick['last']}.{session}\n"
-            f"Last 1H closes, oldest first: {closes or 'unavailable'}.\n"
+            f"{symbol} bid {tick['bid']} ask {tick['ask']} "
+            f"(spread {tick.get('spread', 0)}, {tick['source']}, "
+            f"{tick['age_sec']}s old).{session}\n"
+            f"Last {profile['timeframe']} closes, oldest first: {closes or 'unavailable'}.\n"
+            f"Style: {settings.style_name()} — {profile['note']}\n"
+            f"A buy fills at the ask, a sell at the bid. Quote an entry within "
+            f"{float(profile['max_entry_drift_pct']) * 100:.3f}% of that side.\n"
             f"Risk at most {max_size} lots. Reward must be at least {min_rr}x risk.\n"
             "Give the plan, or NO-TRADE."
         )
         system = SIGNAL_SYSTEM.format(symbol=symbol, max_size=max_size, min_rr=min_rr)
         bot_key = SYMBOL_BOT.get(symbol, "trader_bot_1")
-        _, model = AGENT_MODEL_MAP.get(bot_key, ("nvidia", SUPER))
+        _, model = model_for(bot_key)
 
         reply = await asyncio.to_thread(
             chat_completion,
@@ -539,7 +541,39 @@ class Autopilot:
 
         order["agent_key"] = bot_key
         order["rationale"] = reply.strip()[:400]
-        order["market_price"] = float(tick["last"])
+        # Compare the proposed entry against the side it would actually cross.
+        order["market_price"] = float(
+            tick["ask"] if order["side"] == "buy" else tick["bid"]
+        )
+        order["quote_source"] = tick.get("source")
+        order["quote_age_sec"] = tick.get("age_sec")
+        return order
+
+    async def _poll_symbol(self, symbol: str) -> Optional[dict]:
+        """One market, start to vetted idea, under a deadline.
+
+        The timeout matters as much as the parallelism: without it a single slow
+        model or hanging data request holds up the whole scan, and a decision
+        that arrives late is worse than no decision at all. The budget scales
+        with the trading style — a scalp cannot afford to wait.
+        """
+        profile = settings.style()
+        budget = max(6.0, float(profile["max_quote_age_sec"]) * 1.5)
+        try:
+            order = await asyncio.wait_for(self._ask_bot(symbol), timeout=budget)
+        except asyncio.TimeoutError:
+            await self._emit(
+                "warn",
+                f"{symbol}: gave up after {budget:.0f}s — too slow to be actionable",
+            )
+            return None
+        if not order:
+            return None
+
+        ok, note = self._clamp(order)
+        if not ok:
+            await self._emit("info", f"{symbol}: rejected — {note}")
+            return None
         return order
 
     # ── vetting ─────────────────────────────────────────────
@@ -560,21 +594,25 @@ class Autopilot:
                 2,
             )
 
-        min_rr = float(self.cfg("AUTOPILOT_MIN_RR"))
+        profile = settings.style()
+        min_rr = max(float(self.cfg("AUTOPILOT_MIN_RR")), float(profile["min_rr"]))
         if not order.get("take_profit"):
             return False, "no take profit — unattended entries need a defined target"
         if order.get("rr") is None or order["rr"] < min_rr:
             return False, f"reward:risk {order.get('rr')} is below the {min_rr} minimum"
 
         # A level far from the live price will never fill, or fills at a price
-        # the bot never reasoned about.
+        # the bot never reasoned about. The tolerance follows the trading style,
+        # so scalping is held to pips rather than percent.
         market = order.get("market_price")
         if market:
             drift = abs(order["entry_price"] - market) / market
-            if drift > 0.01:
+            limit = float(profile["max_entry_drift_pct"])
+            if drift > limit:
                 return False, (
-                    f"entry {order['entry_price']} is {drift * 100:.1f}% away "
-                    f"from the live {market}"
+                    f"entry {order['entry_price']} is {drift * 100:.3f}% from the "
+                    f"live {market}, above the {limit * 100:.3f}% "
+                    f"{settings.style_name()} limit"
                 )
 
         return True, "within autopilot limits"
@@ -583,7 +621,7 @@ class Autopilot:
         """Second opinion from the Manager. A non-answer counts as a reject."""
         book = get_open_positions()
         held = ", ".join(f"{p['symbol']} {p['direction']} {p['size']}" for p in book) or "flat"
-        _, model = AGENT_MODEL_MAP.get("manager", ("nvidia", SUPER))
+        _, model = model_for("manager")
 
         prompt = (
             f"Proposed order: {order['side'].upper()} {order['size']} {order['symbol']} "
@@ -623,25 +661,32 @@ class Autopilot:
             return
 
         symbols = list(self.cfg("AUTOPILOT_SYMBOLS"))
+        started = time.monotonic()
+
+        # All markets are polled at once. Sequentially this was the slowest part
+        # of the cycle — four symbols each waiting on data and a model — and every
+        # second spent here is a second the quoted price is drifting away from the
+        # one an order would fill at.
+        results = await asyncio.gather(
+            *(self._poll_symbol(s) for s in symbols), return_exceptions=True
+        )
+
         candidates: list[dict] = []
-        for symbol in symbols:
-            if not self.running:
-                return
-            try:
-                order = await self._ask_bot(symbol)
-            except Exception as exc:
-                await self._emit("warn", f"{symbol}: poll failed — {str(exc)[:120]}")
-                continue
-            if not order:
-                continue
-            ok, note = self._clamp(order)
-            if not ok:
-                await self._emit("info", f"{symbol}: rejected — {note}")
-                continue
-            candidates.append(order)
+        for symbol, result in zip(symbols, results):
+            if isinstance(result, BaseException):
+                await self._emit("warn", f"{symbol}: poll failed — {str(result)[:120]}")
+            elif result:
+                candidates.append(result)
+
+        scan_sec = time.monotonic() - started
+        if not self.running:
+            return
 
         if not candidates:
-            await self._emit("info", f"Scanned {len(symbols)} markets, nothing worth taking")
+            await self._emit(
+                "info",
+                f"Scanned {len(symbols)} markets in {scan_sec:.1f}s, nothing worth taking",
+            )
             return
 
         # One entry per cycle at most, and it is the best reward:risk on offer.
@@ -652,6 +697,13 @@ class Autopilot:
                 f"{len(candidates)} ideas passed — taking {best['symbol']} "
                 f"on the best reward:risk ({best['rr']})",
             )
+
+        # Re-price against the market as it is now, not as it was when the bot
+        # was asked. Seconds passed while models were thinking; refreshing the
+        # entry turns that delay into a few points of slippage instead of a
+        # gate rejection, while the stop and target keep their original distance
+        # so the risk on the trade is unchanged.
+        await self._reprice(best)
 
         approved, checks = await asyncio.to_thread(evaluate_order, best)
         if not approved:
@@ -681,6 +733,39 @@ class Autopilot:
             return
 
         await self._commit(best, checks, reason)
+
+    async def _reprice(self, order: dict) -> None:
+        """Shift the entry to the current crossing price, keeping risk intact.
+
+        The stop and target are moved by the same amount as the entry, so the
+        distance to each — and therefore the USD risk and the reward:risk — is
+        preserved. Only the level changes, which is exactly what a market order
+        does anyway.
+        """
+        quote = await asyncio.to_thread(get_quote, order["symbol"])
+        if not quote:
+            return
+        fresh, _ = quote_is_tradeable(quote)
+        if not fresh:
+            return
+
+        market = float(quote["ask"] if order["side"] == "buy" else quote["bid"])
+        shift = round(market - float(order["entry_price"]), 5)
+        if shift == 0:
+            return
+
+        order["entry_price"] = round(market, 5)
+        order["stop_loss"] = round(float(order["stop_loss"]) + shift, 5)
+        if order.get("take_profit"):
+            order["take_profit"] = round(float(order["take_profit"]) + shift, 5)
+        order["market_price"] = market
+        order["repriced_by"] = shift
+
+        await self._emit(
+            "info",
+            f"{order['symbol']}: re-priced to the live {market} "
+            f"(moved {shift:+.5f} while deciding; stop and target followed)",
+        )
 
     # ── commit ──────────────────────────────────────────────
 

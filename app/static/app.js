@@ -78,7 +78,7 @@ const D = {};
  'clearBtn','convoBtn',
  'apilotState','apilotToggle','apilotRefresh','apilotDest','brokerPanel','apilotStats',
  'apilotGuards','apilotFeed',
- 'bkMode','bkToken','bkAccount','bkRegion','bkEnabled','bkSave','bkHint'
+ 'bkMode','bkToken','bkAccount','bkRegion','bkEnabled','bkSave','bkHint','bkStyle'
 ].forEach(id => D[id] = document.getElementById(id));
 
 const ctx  = D.officeCanvas.getContext('2d');
@@ -147,7 +147,7 @@ function bindUI() {
     D.apilotRefresh.onclick = loadAutopilot;
     D.apilotToggle.onclick = toggleAutopilot;
     D.bkSave.onclick = saveBrokerConfig;
-    ['bkMode','bkToken','bkAccount','bkRegion','bkEnabled'].forEach(id =>
+    ['bkMode','bkToken','bkAccount','bkRegion','bkEnabled','bkStyle'].forEach(id =>
         D[id].addEventListener('input', () => { window.brokerFormDirty = true; }));
 
     addEventListener('keydown', e => {
@@ -196,6 +196,7 @@ async function refreshStatus() {
             ? (S.mode === 'broker' ? 'BROKER — REAL ORDERS' : 'LIVE MODE')
             : 'LOCAL DEMO';
         D.modeBadge.classList.toggle('live', real);
+        S.style = j.style || 'day';
         D.orbSub.textContent = real ? 'LIVE' : 'SIMULATED';
         if (j.kill_switch_active && !S.kill) applyKill(true);
     } catch (_) {}
@@ -1481,6 +1482,7 @@ async function loadBrokerForm() {
     try {
         const c = await (await fetch('/broker/config')).json();
         D.bkMode.value = c.mode || 'paper';
+        D.bkStyle.value = (S.exec && S.style) || 'day';
         D.bkAccount.value = c.account_id || '';
         D.bkRegion.value = c.region || 'london';
         D.bkEnabled.checked = !!c.trading_enabled;
@@ -1502,6 +1504,15 @@ async function saveBrokerConfig() {
     // keeps the saved token instead of wiping it.
     const tok = D.bkToken.value.trim();
     if (tok) body.token = tok;
+
+    // Style is a separate endpoint: it changes candles, freshness limits,
+    // entry tolerance and model routing together.
+    try {
+        await fetch('/style', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ style: D.bkStyle.value }),
+        });
+    } catch (_) {}
 
     if (body.trading_enabled && body.mode === 'broker' && !tok) {
         // fine — they may be reusing a saved token; the status check will tell.
@@ -1797,9 +1808,17 @@ async function loadHub() {
             D.tickers.innerHTML = keys.map(k => {
                 const d = m[k] || {};
                 if (d.last == null) return `<div class="tick dead"><span class="tick-sym">${esc(k)}</span><span class="tick-px">—</span><span class="tick-rng">unavailable</span></div>`;
-                return `<div class="tick"><span class="tick-sym">${esc(k)}</span>` +
+                // Age and source matter more than the number itself: a price
+                // too old for the active style is not one you can trade on.
+                const age = d.age_sec == null ? '' : (d.age_sec < 90
+                    ? `${Math.round(d.age_sec)}s` : `${Math.round(d.age_sec / 60)}m`);
+                const spread = d.spread ? ` · sp ${d.spread}` : '';
+                const stale = d.tradeable === false;
+                return `<div class="tick${stale ? ' stale' : ''}" title="${esc(d.freshness || '')}">` +
+                       `<span class="tick-sym">${esc(k)}</span>` +
                        `<span class="tick-px">${d.last}</span>` +
-                       `<span class="tick-rng">H ${d.high} · L ${d.low}</span></div>`;
+                       `<span class="tick-rng">${esc(d.source || '')} ${age}${spread}` +
+                       `${stale ? ' · STALE' : ''}</span></div>`;
             }).join('');
         }
     } catch (_) { D.tickers.innerHTML = '<div class="hub-empty">Market feed unreachable.</div>'; }
@@ -1811,6 +1830,9 @@ async function loadHub() {
         const cls = pnl > 0 ? 'up' : pnl < 0 ? 'down' : '';
         D.acctStats.innerHTML =
             row('Mode', (j.trading_mode || 'paper').toUpperCase()) +
+            row('Style', `${(j.style || 'day').toUpperCase()} · ${j.style_profile?.timeframe || ''}`) +
+            row('Price feed', (j.quote_source || 'public').toUpperCase(),
+                j.quote_source === 'broker' ? 'good' : '') +
             row('Kill switch', j.kill_switch_active ? 'ACTIVE' : 'released') +
             row('Open positions', j.open_positions ?? 0) +
             row('Daily P&L', `<span class="${cls}">${pnl >= 0 ? '+' : ''}${Number(pnl).toFixed(2)}</span>`);

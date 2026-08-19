@@ -1,7 +1,7 @@
 """Base agent class that all agents inherit from."""
 from typing import Optional
 
-from app.llm_client import AGENT_MODEL_MAP, chat_completion
+from app.llm_client import AGENT_MODEL_MAP, chat_completion, model_for
 from app.db import log_event
 from app.memory import save_message, get_history
 from app.market_data import format_market_context
@@ -60,10 +60,13 @@ class BaseAgent:
                 messages.append(msg)
             messages.append({"role": "user", "content": user_message})
 
-            # Try LLM call
+            # Resolved per call, not at startup, so switching to scalping takes
+            # effect immediately instead of after a restart.
+            provider, model = model_for(self.agent_key)
+
             response = chat_completion(
-                provider=self._provider,
-                model=self._model,
+                provider=provider,
+                model=model,
                 system_prompt=prompt,
                 user_message=user_message,
                 history=history,

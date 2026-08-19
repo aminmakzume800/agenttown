@@ -180,6 +180,16 @@ class ExecutionRouter:
         self, agent_key, symbol, direction, size, entry_price,
         stop_loss, take_profit, opened_by,
     ) -> dict:
+        # Fill at the live crossing price, not at whatever the agent proposed.
+        # A paper fill that ignores the market is a simulation of nothing, and
+        # ignoring the spread flatters every short-term trade.
+        from app.market_data import entry_price_for
+
+        requested = entry_price
+        live = entry_price_for(symbol, direction)
+        if live:
+            entry_price = live
+
         position_id = insert_position(
             agent_key=agent_key,
             symbol=symbol,
@@ -195,7 +205,7 @@ class ExecutionRouter:
             action_type="trade_executed",
             detail=f"{direction} {size} {symbol} @ {entry_price}",
             metadata=f"position_id={position_id}, sl={stop_loss}, tp={take_profit}, "
-                     f"mode=paper, by={opened_by}",
+                     f"mode=paper, by={opened_by}, requested={requested}",
         )
         return {
             "ok": True,
@@ -204,6 +214,7 @@ class ExecutionRouter:
             "direction": direction,
             "size": size,
             "entry_price": entry_price,
+            "requested_price": requested,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "status": "filled_simulated",

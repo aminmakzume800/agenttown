@@ -47,6 +47,23 @@ THINKING_OFF = {"chat_template_kwargs": {"thinking": False}}
 # scratchpad, so an outage degrades latency and depth rather than the feature.
 FALLBACK_CHAIN = [LLAMA_8B, NANO]
 
+# Scalping overrides. At a one-minute horizon the price moves while a big model
+# is still thinking, so a slower-but-deeper answer is worth less than a fast one:
+# by the time Super has replied (~4.7 s) the entry it quoted is often already
+# off-market and gets refused. The deterministic risk gates do the real
+# protecting and cost nothing, so speed is the right trade here.
+# Day and swing keep the stronger models, where seconds do not matter.
+SCALP_MODEL_MAP: dict[str, str] = {
+    "manager": LLAMA_8B,          # 0.7 s instead of 4.7 s
+    "risk_manager": LLAMA_8B,
+    "super_trader": NANO,         # 1.1 s instead of 7.0 s
+    "computer_scientist": NANO,
+    "trader_bot_1": LLAMA_8B,
+    "trader_bot_2": LLAMA_8B,
+    "trader_bot_3": LLAMA_8B,
+    "trader_bot_4": LLAMA_8B,
+}
+
 AGENT_MODEL_MAP: dict[str, tuple[str, str]] = {
     # Decisions that gate money get the strongest reasoning model.
     "manager": ("nvidia", SUPER),
@@ -61,6 +78,19 @@ AGENT_MODEL_MAP: dict[str, tuple[str, str]] = {
     "trader_bot_3": ("nvidia", NANO),
     "trader_bot_4": ("nvidia", NANO),
 }
+
+
+def model_for(agent_key: str, style: str | None = None) -> tuple[str, str]:
+    """Which model an agent should use, given the active trading style.
+
+    One place decides this so the chat path and the autopilot never disagree
+    about who is answering.
+    """
+    provider, model = AGENT_MODEL_MAP.get(agent_key, ("nvidia", NANO))
+    active = (style or settings.style_name()).lower()
+    if active == "scalp":
+        model = SCALP_MODEL_MAP.get(agent_key, LLAMA_8B)
+    return provider, model
 
 
 # ──────────────────────────────────────────────

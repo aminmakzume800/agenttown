@@ -23,9 +23,16 @@ from app.trading.backtest import run_backtest
 from app.trading.proposal import parse_proposal
 from app.trading.risk_rules import evaluate_order
 from app.websocket_manager import ws_manager
-from app.config import settings
+from app.config import persist_env, settings
 from app.memory import init_memory_table, get_history, clear_history
-from app.market_data import get_current_price, get_market_summary, get_candles
+from app.market_data import (
+    clear_quote_cache,
+    entry_price_for,
+    get_candles,
+    get_market_summary,
+    get_quote,
+    quote_is_tradeable,
+)
 from app.db import close_position as db_close_position, realised_pnl
 from app.autopilot import autopilot
 from app.tts import synthesize as tts_synthesize, is_available as tts_available
@@ -271,7 +278,42 @@ def get_status():
         "open_positions": len(positions),
         "daily_pnl": pnl,
         "autopilot_running": autopilot.running,
+        "style": settings.style_name(),
+        "style_profile": settings.style(),
+        "quote_source": "broker" if (settings.PREFER_BROKER_QUOTES and broker.is_configured)
+                        else "public",
     }
+
+
+class StyleRequest(BaseModel):
+    style: str
+
+
+@app.post("/style")
+def set_style(req: StyleRequest):
+    """Switch between scalp, day and swing.
+
+    This changes the candles the agents read, how fresh a quote must be, how far
+    an entry may sit from the market, and the minimum reward:risk — all at once,
+    because those settings only make sense together.
+    """
+    name = req.style.strip().lower()
+    if name not in settings.STYLE_PROFILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown style '{name}'. Choose one of: "
+                   + ", ".join(settings.STYLE_PROFILES),
+        )
+    settings.TRADING_STYLE = name
+    persist_env({"TRADING_STYLE": name})
+    clear_quote_cache()
+    log_event(
+        agent_key="system",
+        action_type="style_changed",
+        detail=f"Trading style set to {name}",
+        metadata=str(settings.style()),
+    )
+    return {"ok": True, "style": name, "profile": settings.style()}
 
 
 # --- Broker bridge (MT5 on any OS) ---
@@ -544,8 +586,10 @@ def trade_close(req: ClosePositionRequest):
     if not pos:
         raise HTTPException(status_code=404, detail="Open position not found.")
 
-    tick = get_current_price(pos["symbol"])
-    exit_price = tick["last"] if tick and tick.get("last") else pos["entry_price"]
+    # Exiting a long means selling into the bid; a short buys back at the ask.
+    is_long = str(pos.get("direction", "")).lower() in ("buy", "long")
+    exit_price = entry_price_for(pos["symbol"], "sell" if is_long else "buy") \
+        or pos["entry_price"]
 
     pnl = realised_pnl(
         symbol=pos["symbol"],
@@ -642,11 +686,12 @@ def autopilot_config(req: AutopilotConfigRequest):
 
 @app.get("/market/price/{symbol}")
 def market_price(symbol: str):
-    """Get current price for a symbol."""
-    price = get_current_price(symbol)
-    if not price:
+    """Live quote for a symbol: bid, ask, spread, source and age."""
+    quote = get_quote(symbol)
+    if not quote:
         return {"ok": False, "error": f"No data for {symbol}"}
-    return {"ok": True, "data": price}
+    fresh, note = quote_is_tradeable(quote)
+    return {"ok": True, "data": quote, "tradeable": fresh, "freshness": note}
 
 
 @app.get("/market/summary")

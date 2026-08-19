@@ -97,6 +97,61 @@ class Settings:
     # Seconds to wait on a broker call before giving up.
     BROKER_TIMEOUT_SEC: float = float(os.getenv("BROKER_TIMEOUT_SEC", "20"))
 
+    # ── Price feed ──────────────────────────────────────────
+    # The broker's own bid/ask is the price you actually get filled at, so it is
+    # preferred for every read — including paper mode, where fills are simulated
+    # but the analysis should still be against the real market.
+    # Set false to force the free public feed only.
+    PREFER_BROKER_QUOTES: bool = _flag("PREFER_BROKER_QUOTES", True)
+
+    # Quotes are cached this long. Keep it small: it exists to stop one agent
+    # message firing several identical requests, not to serve old prices.
+    QUOTE_CACHE_TTL_SEC: float = float(os.getenv("QUOTE_CACHE_TTL_SEC", "1.5"))
+
+    # ── Trading style ───────────────────────────────────────
+    # Drives how fresh a price must be, which candles the agents look at, and
+    # how far an entry may sit from the live market before it is refused.
+    # scalp — minutes, needs the tightest tolerances
+    # day   — intraday, the default
+    # swing — multi-day, most forgiving
+    TRADING_STYLE: str = os.getenv("TRADING_STYLE", "day").strip().lower()
+
+    STYLE_PROFILES: dict[str, dict] = {
+        "scalp": {
+            "timeframe": "1m",
+            "candles": 30,
+            "max_quote_age_sec": 10.0,
+            "max_entry_drift_pct": 0.0006,   # ~6 pips on EUR/USD
+            "min_rr": 1.0,
+            "note": "Minutes. Entries must be at the live price.",
+        },
+        "day": {
+            "timeframe": "15m",
+            "candles": 40,
+            "max_quote_age_sec": 90.0,
+            "max_entry_drift_pct": 0.002,    # ~20 pips on EUR/USD
+            "min_rr": 1.5,
+            "note": "Intraday. Opened and closed the same session.",
+        },
+        "swing": {
+            "timeframe": "1h",
+            "candles": 60,
+            "max_quote_age_sec": 600.0,
+            "max_entry_drift_pct": 0.01,
+            "min_rr": 2.0,
+            "note": "Held across sessions. Lowest priority here.",
+        },
+    }
+
+    def style(self, name: str | None = None) -> dict:
+        """Active trading-style profile, falling back to 'day' if unset."""
+        key = (name or self.TRADING_STYLE or "day").strip().lower()
+        return self.STYLE_PROFILES.get(key, self.STYLE_PROFILES["day"])
+
+    def style_name(self) -> str:
+        key = (self.TRADING_STYLE or "day").strip().lower()
+        return key if key in self.STYLE_PROFILES else "day"
+
     # ── Autopilot (unattended trading) ──────────────────────
     # Off on boot by design: the loop only ever starts because someone asked
     # for it, either with this flag or the /autopilot/start button.

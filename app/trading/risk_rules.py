@@ -123,6 +123,46 @@ def check_symbol_exposure(symbol: str, size: float) -> tuple[bool, str]:
     return True, f"{symbol} exposure {total:.2f}/{settings.MAX_POSITION_SIZE:.2f} lots OK."
 
 
+def check_price_freshness(symbol: str, entry_price: float, side: str) -> tuple[bool, str]:
+    """Reject an order priced off a stale quote, or too far from the market.
+
+    This is the gate that makes short-term trading honest. Two failure modes it
+    catches:
+
+      * the quote itself is old — a scalp entry off a minute-old price is a
+        guess, so the age limit tightens with the trading style
+      * the entry sits far from the live market — it will either never fill, or
+        fill somewhere the agent never reasoned about
+
+    Both limits come from the active style profile, so switching to scalping
+    automatically tightens them rather than needing a second set of settings.
+    """
+    from app.market_data import get_quote, quote_is_tradeable
+
+    profile = settings.style()
+    quote = get_quote(symbol)
+    fresh, note = quote_is_tradeable(quote)
+    if not fresh:
+        return False, note
+
+    market = float(quote["ask"] if str(side).lower() in ("buy", "long") else quote["bid"])
+    if market <= 0:
+        return False, "Live price unavailable — cannot verify the entry."
+
+    drift = abs(float(entry_price) - market) / market
+    limit = float(profile["max_entry_drift_pct"])
+    if drift > limit:
+        return False, (
+            f"Entry {entry_price} is {drift * 100:.3f}% from the live {market} "
+            f"({quote['source']}), above the {limit * 100:.3f}% limit for "
+            f"{settings.style_name()} trading."
+        )
+    return True, (
+        f"Entry within {drift * 100:.3f}% of live {market} "
+        f"({quote['source']}, {quote['age_sec']}s old)."
+    )
+
+
 def evaluate_order(order: dict) -> tuple[bool, list[str]]:
     """Run every gate against a parsed order.
 
@@ -139,12 +179,15 @@ def evaluate_order(order: dict) -> tuple[bool, list[str]]:
     size = float(order.get("size", 0) or 0)
     risk = float(order.get("risk_usd", 0) or 0)
 
+    entry = float(order.get("entry_price", 0) or 0)
+
     results = [
         check_position_size(size),
         check_daily_drawdown(risk),
         check_max_trades(),
         check_symbol_exposure(symbol, size),
         check_correlation(symbol, side),
+        check_price_freshness(symbol, entry, side),
         check_news_blackout(),
     ]
 

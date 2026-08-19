@@ -209,6 +209,13 @@
                                 <span class="hub-sub">Trading.com / any MT5 broker · via MetaApi</span>
                             </div>
                             <form id="brokerForm" class="broker-form" autocomplete="off">
+                                <label>Trading style
+                                    <select id="bkStyle" class="mini-select">
+                                        <option value="scalp">scalp — 1m bars, needs a live broker feed</option>
+                                        <option value="day">day — 15m bars, intraday</option>
+                                        <option value="swing">swing — 1h bars, held longer</option>
+                                    </select>
+                                </label>
                                 <label>Execution mode
                                     <select id="bkMode" class="mini-select">
                                         <option value="paper">paper — simulated locally</option>

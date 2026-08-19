@@ -380,6 +380,9 @@ kbd {
 .tick-px  { color: var(--cyan); }
 .tick-rng { color: var(--text-faint); font-size: 9px; }
 .tick.dead .tick-px { color: var(--text-faint); }
+/* A price too old for the active trading style — visible at a glance. */
+.tick.stale .tick-px  { color: var(--amber); }
+.tick.stale .tick-rng { color: var(--amber); }
 
 .stat-rows { display: flex; flex-direction: column; gap: 6px; }
 .stat-row { display: flex; justify-content: space-between; font-size: 10.5px; }
