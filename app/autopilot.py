@@ -32,12 +32,20 @@ from app.db import (
     get_open_positions,
     log_event,
     realised_pnl,
+    update_stop,
 )
 from app.llm_client import chat_completion, model_for
 from app.learning import desk_record, format_record
 from app.market_data import get_candles, get_quote, quote_is_tradeable
 from app.news_calendar import calendar_context
 from app.trading.indicators import atr, format_indicators
+from app.trading.manage import plan_stop_move, should_time_exit
+from app.trading.strategy import (
+    MIN_CONFLUENCE,
+    evaluate_setup,
+    format_setup,
+    position_size,
+)
 from app.trading.broker import BrokerError, broker, http_json
 from app.trading.execution import router as execution
 from app.trading.proposal import parse_proposal, risk_amount
@@ -71,6 +79,25 @@ Rules you must follow:
 - The stop must sit on the losing side of entry, the target on the winning side.
 - Reward must be at least {min_rr} times risk.
 - Quote prices at the same precision as the data you were given.
+- No reasoning, no markdown, no extra lines."""
+
+REVIEW_SYSTEM = """You are the {symbol} trader bot. A deterministic rule engine has already found a setup and computed its levels. You are the sanity check, not the source of the idea.
+
+Output ONLY these six lines and nothing else:
+SIGNAL: BUY or SELL or NO-TRADE
+ENTRY: <price>
+SL: <price>
+TP: <price>
+SIZE: <lots>
+WHY: <one short sentence>
+
+Rules:
+- To confirm, repeat the entry, stop and target from the setup EXACTLY as given.
+- Answer NO-TRADE if the wider context makes this unwise: an economic release
+  about to land, a poor track record on this instrument, or momentum that
+  contradicts the setup. Say which.
+- Never substitute your own levels. The rules computed them from ATR and
+  structure; changing them defeats the point.
 - No reasoning, no markdown, no extra lines."""
 
 MANAGER_SYSTEM = """You are the desk Manager reviewing one order an unattended loop wants to place. The deterministic risk gate has already passed it, so you are the judgement call, not the arithmetic.
@@ -415,7 +442,12 @@ class Autopilot:
                 hit = "stop loss"
             elif tp > 0 and ((is_buy and price >= tp) or (not is_buy and price <= tp)):
                 hit = "take profit"
+
             if not hit:
+                # Not closing — so protect what the trade has earned. A winner
+                # allowed to run back to its stop is a loss that was never
+                # necessary.
+                await self._protect(pos, price)
                 continue
 
             pnl = realised_pnl(
@@ -473,7 +505,81 @@ class Autopilot:
                 adopted,
             )
 
+    async def _protect(self, pos: dict, price: float) -> None:
+        """Tighten the stop on a position that is in profit.
+
+        Break-even first, then trailing. This is the part that turns a good entry
+        into a kept win: without it a trade can go well in favour and still come
+        back to the original stop for a full loss.
+
+        In broker mode the stop lives on the broker, so it is modified there and
+        the local row is updated to match. The stop only ever moves closer to
+        price, never further away.
+        """
+        atr_value = None
+        try:
+            candles = await asyncio.to_thread(get_candles, pos["symbol"])
+            if candles:
+                atr_value = atr(candles)
+        except Exception:
+            pass
+
+        move = plan_stop_move(pos, price, atr_value)
+        if not move:
+            return
+
+        moved = False
+        broker_pid = pos.get("broker_position_id")
+        if execution.is_broker and broker_pid:
+            try:
+                result = await asyncio.to_thread(
+                    broker.modify_position, broker_pid, move["new_stop"],
+                    float(pos.get("take_profit") or 0) or None,
+                )
+                moved = bool(result.get("ok"))
+                if not moved:
+                    await self._emit(
+                        "warn",
+                        f"{pos['symbol']}: broker refused the stop move "
+                        f"({result.get('message')})",
+                    )
+                    return
+            except BrokerError as exc:
+                await self._emit("warn", f"{pos['symbol']}: stop move failed — {exc}")
+                return
+        else:
+            moved = True                     # paper: the local row is the book
+
+        if not moved:
+            return
+
+        await asyncio.to_thread(update_stop, pos["id"], move["new_stop"])
+        log_event(
+            agent_key="autopilot",
+            action_type="stop_moved",
+            detail=f"{pos['symbol']} stop {pos.get('stop_loss')} -> {move['new_stop']} "
+                   f"({move['kind']})",
+            metadata=f"position={pos['id']} r={move['r_multiple']} {move['reason']}",
+        )
+        await self._emit(
+            "trade",
+            f"{pos['symbol']}: {move['reason']} (stop now {move['new_stop']})",
+            {"position_id": pos["id"], "new_stop": move["new_stop"],
+             "kind": move["kind"], "r_multiple": move["r_multiple"]},
+        )
+
     # ── idea generation ─────────────────────────────────────
+
+    @staticmethod
+    def _account_balance() -> Optional[float]:
+        """Balance used for position sizing, or None if it cannot be read."""
+        if execution.is_broker and broker.is_configured:
+            try:
+                return float(broker.account_info().get("balance") or 0) or None
+            except BrokerError:
+                return None
+        # Paper mode: notional starting balance adjusted by what has been realised.
+        return 10_000.0 + get_daily_pnl()
 
     async def _ask_bot(self, symbol: str) -> Optional[dict]:
         """Poll one bot and return a parsed order, or None for no setup."""
@@ -501,6 +607,27 @@ class Autopilot:
         max_size = float(self.cfg("AUTOPILOT_MAX_SIZE"))
         min_rr = max(float(self.cfg("AUTOPILOT_MIN_RR")), float(profile["min_rr"]))
 
+        # The rules decide whether a setup exists. Asking a model for a trade
+        # produces one every time, which is how random entries happen; this way
+        # most polls correctly find nothing.
+        setup = None
+        if settings.REQUIRE_RULE_SETUP:
+            setup = evaluate_setup(candles, float(tick["bid"]), float(tick["ask"]))
+            if not setup:
+                await self._emit(
+                    "info",
+                    f"{symbol}: no setup — conditions do not line up "
+                    f"(rules need {MIN_CONFLUENCE}/6 agreeing)",
+                )
+                return None
+            if setup["rr"] < min_rr:
+                await self._emit(
+                    "info",
+                    f"{symbol}: setup found but reward:risk {setup['rr']} is under "
+                    f"the {min_rr} minimum — skipped",
+                )
+                return None
+
         session = ""
         if tick.get("high") and tick.get("low"):
             session = (
@@ -515,7 +642,7 @@ class Autopilot:
         events = calendar_context(symbol)
         record = format_record(bot_key)
 
-        prompt = (
+        context = (
             f"{symbol} bid {tick['bid']} ask {tick['ask']} "
             f"(spread {tick.get('spread', 0)}, {tick['source']}, "
             f"{tick['age_sec']}s old).{session}\n"
@@ -523,14 +650,34 @@ class Autopilot:
             + (f"\n{indicators}\n" if indicators else "")
             + (f"\n{events}\n" if events else "")
             + (f"\n{record}\n" if record else "")
-            + f"\nStyle: {settings.style_name()} — {profile['note']}\n"
-            f"A buy fills at the ask, a sell at the bid. Quote an entry within "
-            f"{float(profile['max_entry_drift_pct']) * 100:.3f}% of that side.\n"
-            f"Base the stop on the ATR above, not a round number.\n"
-            f"Risk at most {max_size} lots. Reward must be at least {min_rr}x risk.\n"
-            "Give the plan, or NO-TRADE."
         )
-        system = SIGNAL_SYSTEM.format(symbol=symbol, max_size=max_size, min_rr=min_rr)
+
+        if setup:
+            # Reviewing a concrete setup, not inventing one. The model can reject
+            # it on context the rules cannot see, but it cannot make one up.
+            prompt = (
+                context
+                + f"\n{format_setup(setup, symbol)}\n"
+                + f"\nStyle: {settings.style_name()} — {profile['note']}\n"
+                "The levels above came from the rules. Confirm the plan by "
+                "repeating them exactly, or answer NO-TRADE with a reason if "
+                "something in the context above makes this a bad trade right now "
+                "(a release about to land, a poor record on this instrument, "
+                "conflicting momentum).\n"
+                "Do not change the levels. Do not invent a different trade."
+            )
+            system = REVIEW_SYSTEM.format(symbol=symbol)
+        else:
+            prompt = (
+                context
+                + f"\nStyle: {settings.style_name()} — {profile['note']}\n"
+                f"A buy fills at the ask, a sell at the bid. Quote an entry within "
+                f"{float(profile['max_entry_drift_pct']) * 100:.3f}% of that side.\n"
+                f"Base the stop on the ATR above, not a round number.\n"
+                f"Risk at most {max_size} lots. Reward at least {min_rr}x risk.\n"
+                "Give the plan, or NO-TRADE."
+            )
+            system = SIGNAL_SYSTEM.format(symbol=symbol, max_size=max_size, min_rr=min_rr)
         bot_key = SYMBOL_BOT.get(symbol, "trader_bot_1")
         _, model = model_for(bot_key)
 
@@ -552,6 +699,38 @@ class Autopilot:
         if not order:
             await self._emit("info", f"{symbol}: reply was not a usable plan")
             return None
+
+        if setup:
+            # Trust the rules over the model's transcription. If the levels drift,
+            # the computed ones win — otherwise a stray digit silently becomes the
+            # real stop.
+            drifted = (abs(order["stop_loss"] - setup["stop"]) > 1e-5
+                       or abs(order["entry_price"] - setup["entry"]) > 1e-5)
+            order["entry_price"] = setup["entry"]
+            order["stop_loss"] = setup["stop"]
+            order["take_profit"] = setup["target"]
+            order["rr"] = setup["rr"]
+            order["confluence"] = setup["confluence"]
+            order["setup_reasons"] = setup["reasons"]
+            if drifted:
+                await self._emit(
+                    "info",
+                    f"{symbol}: bot restated the levels inexactly — using the "
+                    f"rule-computed values",
+                )
+
+            # Size from account risk, not a fixed lot. A losing run shrinks the
+            # position automatically.
+            balance = await asyncio.to_thread(self._account_balance)
+            if balance:
+                sized = position_size(
+                    balance, setup["entry"], setup["stop"], symbol,
+                    risk_pct=float(settings.RISK_PER_TRADE_PCT),
+                )
+                order["size"] = min(sized, float(self.cfg("AUTOPILOT_MAX_SIZE")))
+            order["risk_usd"] = round(
+                risk_amount(symbol, order["entry_price"], order["stop_loss"],
+                            order["size"]), 2)
 
         order["agent_key"] = bot_key
         order["rationale"] = reply.strip()[:400]

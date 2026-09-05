@@ -223,6 +223,32 @@ def insert_position(
     return position_id
 
 
+def update_stop(position_id: str, stop_loss: float,
+                take_profit: float | None = None) -> bool:
+    """Move the stop (and optionally the target) on an open position.
+
+    Trade management calls this after the broker has accepted the change, so the
+    local book agrees with what is actually protecting the trade.
+    """
+    conn = _get_conn()
+    try:
+        if take_profit is None:
+            cur = conn.execute(
+                "UPDATE positions SET stop_loss = ? WHERE id = ? AND status = 'open'",
+                (float(stop_loss), position_id),
+            )
+        else:
+            cur = conn.execute(
+                """UPDATE positions SET stop_loss = ?, take_profit = ?
+                   WHERE id = ? AND status = 'open'""",
+                (float(stop_loss), float(take_profit), position_id),
+            )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def get_position_by_broker_id(broker_position_id: str) -> dict | None:
     """Find the local row that mirrors a given broker ticket."""
     conn = _get_conn()

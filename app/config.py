@@ -118,6 +118,27 @@ class Settings:
     # Optional JSON calendar feed. Blank uses the built-in schedule only.
     NEWS_API_URL: str = os.getenv("NEWS_API_URL", "")
 
+    # ── Trade management ────────────────────────────────────
+    # Move the stop to entry once the trade is this many risk-units ahead. From
+    # then on it cannot lose, which is what stops a good entry becoming a loss.
+    BREAK_EVEN_R: float = float(os.getenv("BREAK_EVEN_R", "1.0"))
+    # Beyond this, trail the stop instead of holding it at entry.
+    TRAIL_START_R: float = float(os.getenv("TRAIL_START_R", "1.5"))
+    # Trailing distance as a multiple of ATR. Too tight and normal noise closes
+    # the trade; too wide and the point is lost.
+    TRAIL_ATR_MULT: float = float(os.getenv("TRAIL_ATR_MULT", "1.5"))
+    # Close a position that has gone nowhere for this many bars. 0 disables.
+    MAX_BARS_IN_TRADE: int = int(os.getenv("MAX_BARS_IN_TRADE", "24"))
+
+    # Fraction of the account risked per trade. Fixed-fractional sizing shrinks
+    # the position automatically during a losing run.
+    RISK_PER_TRADE_PCT: float = float(os.getenv("RISK_PER_TRADE_PCT", "0.005"))
+
+    # Entries come from the deterministic rules in trading/strategy.py, with the
+    # LLM reviewing rather than inventing. Turning this off returns to asking a
+    # model for a trade, which produces one whether or not a setup exists.
+    REQUIRE_RULE_SETUP: bool = _flag("REQUIRE_RULE_SETUP", True)
+
     # ── Learning from outcomes ──────────────────────────────
     # Feeds each agent its own recent results before it proposes again, so a
     # losing pattern is visible to it rather than repeated blindly.

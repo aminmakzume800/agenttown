@@ -487,6 +487,32 @@ class BrokerBridge:
         result["size"] = body["volume"]
         return result
 
+    def modify_position(
+        self,
+        broker_position_id: str,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+    ) -> dict:
+        """Move the stop or target on an open position.
+
+        Used by trade management to bring a stop to break-even and then trail it.
+        The stop lives on the broker's server, so changing it here means the
+        protection holds even if this app is not running.
+        """
+        if not self.trading_enabled:
+            raise BrokerError(
+                "Broker trading is switched off — cannot modify a position."
+            )
+        body: dict = {
+            "actionType": "POSITION_MODIFY",
+            "positionId": str(broker_position_id),
+        }
+        if stop_loss is not None:
+            body["stopLoss"] = float(stop_loss)
+        if take_profit:
+            body["takeProfit"] = float(take_profit)
+        return self._trade(body)
+
     def close_position(self, broker_position_id: str) -> dict:
         """Close one position at market."""
         if not self.trading_enabled:
