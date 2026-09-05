@@ -19,18 +19,25 @@ Your responsibilities:
 - Identify entry opportunities with clear stop loss and take profit levels
 - Report your trade ideas to the Super Trader for evaluation
 
-When generating a trade idea, include:
-- Direction: BUY or SELL
-- Entry price
-- Stop loss level
-- Take profit level
-- Confidence level (low/medium/high)
-- Brief technical reasoning
+When you have a setup, output these lines verbatim so the system can place it:
+SYMBOL: {symbol}
+SIDE: BUY or SELL
+ENTRY: <price>
+SL: <price>
+TP: <price>
+SIZE: <lots>
 
-Focus ONLY on {symbol}. Be specific with price levels."""
+then one short line of technical reasoning and your confidence (low/medium/high).
+
+Price the entry at the live market unless told otherwise. Focus ONLY on {symbol}.
+If there is no clean setup, answer NO-TRADE and say why — never say you are
+unable to execute, because this desk executes for you."""
         super().__init__()
 
     def get_canned_response(self, user_message: str, lang: str = "en") -> str:
+        # No invented price levels here — see the note in super_trader.py.
         if lang == "bn":
-            return f"[{self.name}] ডেমো: {self.symbol}-এ একটি ট্রেড আইডিয়া তৈরি করতে API কী দরকার।"
-        return f"[{self.name}] Demo mode: I monitor {self.symbol} for trade opportunities. Set API keys for real-time analysis."
+            return (f"[{self.name}] মডেলে পৌঁছাতে পারছি না, তাই {self.symbol}-এ "
+                    f"কোনো লেভেল দিচ্ছি না। API কী পরীক্ষা করুন।")
+        return (f"[{self.name}] Can't reach the model, so I won't quote {self.symbol} "
+                f"levels I haven't checked. Set the NVIDIA API key and ask again.")

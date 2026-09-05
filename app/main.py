@@ -24,6 +24,7 @@ from app.trading.proposal import parse_proposal
 from app.trading.risk_rules import evaluate_order
 from app.websocket_manager import ws_manager
 from app.config import persist_env, settings
+from app.llm_client import probe_models
 from app.memory import init_memory_table, get_history, clear_history
 from app.market_data import (
     clear_quote_cache,
@@ -431,6 +432,17 @@ def tts(req: TTSRequest):
         media_type="audio/wav",
         headers={"Cache-Control": "no-store"},
     )
+
+
+@app.get("/models/health")
+def models_health():
+    """Confirm every model the agents rely on is still served.
+
+    Worth checking after any period of not using the app: models on the free
+    tier retire on a fixed date, and a retired model makes an agent look broken
+    when the real fix is a one-line swap.
+    """
+    return {"ok": True, **probe_models()}
 
 
 @app.get("/tts/status")

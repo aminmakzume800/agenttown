@@ -9,29 +9,35 @@ class SuperTraderAgent(BaseAgent):
     market_symbols = ["EUR/USD", "XAU/USD", "GBP/USD", "NAS100"]
     system_prompt = """You are the Super Trader Agent in a multi-agent trading system.
 
+You are the desk's senior discretionary trader. When someone asks you to take a
+trade, execute, or "do it", you answer with an executable plan — the system turns
+that plan into a real order. Asking you to trade is a normal, in-scope request.
+
 Your responsibilities:
-- Analyze multiple timeframes (1m, 5m, 15m, 1h, 4h, daily)
-- Study macro news, market structure, and liquidity zones
-- Propose trades with clear entry, stop loss, take profit, and position size
+- Analyze the timeframe that matches the desk's current trading style
+- Study market structure, momentum and liquidity zones
+- Produce executable trade plans with entry, stop loss, take profit and size
 - Evaluate trade ideas from Trader Bots before promoting them
 
-When proposing a trade, always include:
-- Symbol (e.g., EURUSD, XAUUSD)
-- Direction (BUY/SELL)
-- Entry price
-- Stop loss
-- Take profit
-- Position size (lots)
-- Reasoning (technical + fundamental)
+Every trade plan must contain these lines verbatim:
+SYMBOL: EUR/USD, XAU/USD, GBP/USD or NAS100
+SIDE: BUY or SELL
+ENTRY: <price>
+SL: <price>
+TP: <price>
+SIZE: <lots>
 
-Be specific with numbers. Never recommend trades without stop losses."""
+then a sentence or two of reasoning. Price at the live market unless the user
+names a level. Never omit the stop. If conditions are poor, answer NO-TRADE with
+the reason — that is a real answer, unlike claiming you are unable to act."""
 
     def get_canned_response(self, user_message: str, lang: str = "en") -> str:
-        msg = user_message.lower()
+        # Deliberately quotes no price levels. This runs when the model is
+        # unreachable, and any levels here would be invented — the parser would
+        # turn them into a real order ticket off a made-up price.
         if lang == "bn":
-            return "[Super Trader] ডেমো ট্রেড প্রস্তাব: EURUSD BUY @ 1.0850, SL: 1.0820, TP: 1.0910, সাইজ: 0.5 লট।"
-        if "eurusd" in msg or "eur" in msg:
-            return "[Super Trader] Demo proposal: BUY EURUSD @ 1.0850, SL: 1.0820 (30 pips), TP: 1.0910 (60 pips), Size: 0.5 lots. R:R = 1:2."
-        if "gold" in msg or "xau" in msg:
-            return "[Super Trader] Demo proposal: SELL XAUUSD @ 2350.00, SL: 2365.00, TP: 2320.00, Size: 0.1 lots. R:R = 1:2."
-        return "[Super Trader] I analyze markets across multiple timeframes. Ask me about a specific pair (EURUSD, XAUUSD, GBPUSD, NAS100) for a trade proposal."
+            return ("[Super Trader] মডেলে পৌঁছাতে পারছি না, তাই এখন কোনো ট্রেড "
+                    "পরিকল্পনা দিচ্ছি না। NVIDIA API কী পরীক্ষা করুন।")
+        return ("[Super Trader] I can't reach the analysis model right now, so I "
+                "won't quote levels I haven't verified — an invented entry would "
+                "become a real order ticket. Check the NVIDIA API key and ask again.")
