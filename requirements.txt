@@ -3,3 +3,7 @@ uvicorn[standard]>=0.30.0
 openai>=1.60.0
 python-dotenv>=1.0.1
 yfinance>=0.2.40
+# Current CA bundle. Required explicitly because macOS Python does not use the
+# system keychain: without it, HTTPS calls to the broker fail with
+# CERTIFICATE_VERIFY_FAILED even though the network is fine.
+certifi>=2024.7.4

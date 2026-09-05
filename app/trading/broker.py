@@ -48,6 +48,39 @@ class BrokerError(RuntimeError):
     """A broker call failed in a way the caller needs to see."""
 
 
+_ssl_context = None
+
+
+def _get_ssl_context():
+    """A TLS context with a CA bundle that works on macOS out of the box.
+
+    Python installed from python.org does not use the macOS keychain; it looks
+    for its own CA bundle, and on a fresh install that bundle is missing until
+    the user runs 'Install Certificates.command'. The symptom is
+    CERTIFICATE_VERIFY_FAILED on every HTTPS call, which looks like a broken
+    broker rather than a missing cert store.
+
+    certifi ships a current bundle and is already present because the openai
+    package depends on it, so it is used when available. Verification stays ON
+    in every case — the fix is giving Python the right roots, not skipping the
+    check, which would leave the token exposed to interception.
+    """
+    global _ssl_context
+    if _ssl_context is not None:
+        return _ssl_context
+
+    import ssl
+
+    try:
+        import certifi
+
+        _ssl_context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        # No certifi: fall back to whatever roots the platform gives us.
+        _ssl_context = ssl.create_default_context()
+    return _ssl_context
+
+
 def http_json(
     method: str,
     url: str,
@@ -74,13 +107,25 @@ def http_json(
         request.add_header("Content-Type", "application/json")
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(
+            request, timeout=timeout, context=_get_ssl_context()
+        ) as response:
             raw = response.read().decode("utf-8", "replace")
             status = response.getcode()
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", "replace") if exc.fp else ""
         status = exc.code
     except Exception as exc:
+        message = str(exc)
+        if "CERTIFICATE_VERIFY_FAILED" in message:
+            # Say what to do about it, rather than leaving the user with a raw
+            # OpenSSL string that looks like a network fault.
+            raise BrokerError(
+                "TLS certificate verification failed. This is a local Python "
+                "certificate-store problem, not a broker outage. Fix it with "
+                "either:  pip install --upgrade certifi   or, on macOS, run "
+                "'Install Certificates.command' in /Applications/Python 3.x/."
+            ) from exc
         raise BrokerError(f"Could not reach the broker bridge: {exc}") from exc
 
     try:

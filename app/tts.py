@@ -92,8 +92,15 @@ def synthesize(text: str, agent_key: str = "", lang: str = "en") -> Optional[byt
         },
     )
 
+    # Shares the broker's TLS context so macOS certificate handling is fixed in
+    # one place. Without it this fails with CERTIFICATE_VERIFY_FAILED and the
+    # voice silently falls back to the browser engine.
+    from app.trading.broker import _get_ssl_context
+
     try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
+        with urllib.request.urlopen(
+            req, timeout=45, context=_get_ssl_context()
+        ) as resp:
             audio = resp.read()
         if len(audio) < 512:
             logger.warning("Magpie returned %d bytes — treating as failure", len(audio))
