@@ -108,6 +108,22 @@ class Settings:
     # message firing several identical requests, not to serve old prices.
     QUOTE_CACHE_TTL_SEC: float = float(os.getenv("QUOTE_CACHE_TTL_SEC", "1.5"))
 
+    # ── News blackout ───────────────────────────────────────
+    # On by default. Entering just before a high-impact release means a wider
+    # spread, real slippage on the stop, and a direction decided by the print
+    # rather than by the analysis.
+    NEWS_BLACKOUT_ENABLED: bool = _flag("NEWS_BLACKOUT_ENABLED", True)
+    NEWS_BLACKOUT_BEFORE_MIN: int = int(os.getenv("NEWS_BLACKOUT_BEFORE_MIN", "30"))
+    NEWS_BLACKOUT_AFTER_MIN: int = int(os.getenv("NEWS_BLACKOUT_AFTER_MIN", "15"))
+    # Optional JSON calendar feed. Blank uses the built-in schedule only.
+    NEWS_API_URL: str = os.getenv("NEWS_API_URL", "")
+
+    # ── Learning from outcomes ──────────────────────────────
+    # Feeds each agent its own recent results before it proposes again, so a
+    # losing pattern is visible to it rather than repeated blindly.
+    LEARNING_ENABLED: bool = _flag("LEARNING_ENABLED", True)
+    LEARNING_LOOKBACK: int = int(os.getenv("LEARNING_LOOKBACK", "20"))
+
     # ── Trading style ───────────────────────────────────────
     # Drives how fresh a price must be, which candles the agents look at, and
     # how far an entry may sit from the live market before it is refused.

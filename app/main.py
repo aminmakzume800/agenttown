@@ -25,6 +25,9 @@ from app.trading.risk_rules import evaluate_order
 from app.websocket_manager import ws_manager
 from app.config import persist_env, settings
 from app.llm_client import probe_models
+from app.learning import agent_record, desk_record, format_record
+from app.news_calendar import SYMBOL_CURRENCIES, news_blackout, upcoming_events
+from app.trading.indicators import compute_all
 from app.memory import init_memory_table, get_history, clear_history
 from app.market_data import (
     clear_quote_cache,
@@ -432,6 +435,62 @@ def tts(req: TTSRequest):
         media_type="audio/wav",
         headers={"Cache-Control": "no-store"},
     )
+
+
+@app.get("/indicators/{symbol:path}")
+def indicators_for(symbol: str):
+    """Computed indicators for one instrument — RSI, MACD, ATR, EMAs, swings.
+
+    These are the same numbers injected into the agents' prompts, exposed so the
+    values can be checked independently rather than taken on trust.
+    """
+    candles = get_candles(symbol)
+    if not candles:
+        raise HTTPException(status_code=404, detail=f"No candle data for {symbol}.")
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "style": settings.style_name(),
+        "timeframe": settings.style()["timeframe"],
+        "indicators": compute_all(candles),
+    }
+
+
+@app.get("/news")
+def news(symbol: str = Query("", description="Optional instrument filter"),
+         minutes: int = Query(240)):
+    """Scheduled economic events and whether trading is blocked right now."""
+    currencies = SYMBOL_CURRENCIES.get(symbol) if symbol else None
+    events = upcoming_events(within_minutes=minutes, currencies=currencies)
+    blocked, reason = news_blackout(symbol)
+    return {
+        "ok": True,
+        "symbol": symbol or "all",
+        "blackout_active": blocked,
+        "reason": reason,
+        "events": events,
+        "window": {
+            "enabled": settings.NEWS_BLACKOUT_ENABLED,
+            "before_min": settings.NEWS_BLACKOUT_BEFORE_MIN,
+            "after_min": settings.NEWS_BLACKOUT_AFTER_MIN,
+        },
+    }
+
+
+@app.get("/performance")
+def performance(agent_key: str = Query("", description="Blank for the whole desk")):
+    """Closed-trade results — per agent, or the whole desk.
+
+    This is what the agents are shown before they propose again, so a losing
+    pattern is visible to them instead of silently repeated.
+    """
+    if agent_key:
+        if agent_key not in ALL_AGENTS:
+            raise HTTPException(status_code=404, detail=f"Agent '{agent_key}' not found")
+        return {"ok": True, "agent_key": agent_key,
+                "record": agent_record(agent_key),
+                "coaching": format_record(agent_key)}
+    return {"ok": True, "desk": desk_record(), "learning_enabled": settings.LEARNING_ENABLED}
 
 
 @app.get("/models/health")

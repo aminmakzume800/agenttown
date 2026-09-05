@@ -41,16 +41,19 @@ def check_max_trades() -> tuple[bool, str]:
     return True, f"Open trades OK: {count}/{settings.MAX_CONCURRENT_TRADES}."
 
 
-def check_news_blackout() -> tuple[bool, str]:
-    """Check if a news blackout is currently active.
-    
-    For MVP, this always returns True (no blackout).
-    In production, this would check an economic calendar.
-    
-    Returns (passed, reason).
+def check_news_blackout(symbol: str = "") -> tuple[bool, str]:
+    """Refuse to open a position into a high-impact economic release.
+
+    This used to be a stub that always passed, which meant the desk would
+    happily buy thirty seconds before Non-Farm Payrolls. Now it checks a real
+    schedule of the releases that move these instruments.
+
+    Returns (passed, reason) — passed=False means do not trade.
     """
-    # MVP: No news calendar integration yet
-    return True, "No news blackout active (MVP: calendar not integrated)."
+    from app.news_calendar import news_blackout
+
+    blocked, reason = news_blackout(symbol)
+    return (not blocked), reason
 
 
 def run_all_checks(size: float, risk_amount: float) -> tuple[bool, list[str]]:
@@ -188,7 +191,7 @@ def evaluate_order(order: dict) -> tuple[bool, list[str]]:
         check_symbol_exposure(symbol, size),
         check_correlation(symbol, side),
         check_price_freshness(symbol, entry, side),
-        check_news_blackout(),
+        check_news_blackout(symbol),
     ]
 
     approved = all(passed for passed, _ in results)

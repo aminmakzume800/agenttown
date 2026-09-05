@@ -143,12 +143,36 @@ class BaseAgent:
             if lang == "bn":
                 prompt += "\n\nIMPORTANT: Respond in Bengali (বাংলা)."
 
-            # Inject live market data if agent has market_symbols
+            # Market context: live price, computed indicators, and any economic
+            # release due. Indicators are calculated rather than guessed, so the
+            # agent quotes measurements instead of inventing plausible numbers.
             if self.market_symbols:
+                from app.market_data import get_candles
+                from app.news_calendar import calendar_context
+                from app.trading.indicators import format_indicators
+
                 for sym in self.market_symbols:
                     market_ctx = format_market_context(sym)
-                    if "[Market data unavailable" not in market_ctx:
-                        prompt += f"\n\n{market_ctx}"
+                    if "[Market data unavailable" in market_ctx:
+                        continue
+                    prompt += f"\n\n{market_ctx}"
+
+                    candles = get_candles(sym)
+                    if candles:
+                        block = format_indicators(candles, sym)
+                        if block:
+                            prompt += f"\n{block}"
+
+                    events = calendar_context(sym)
+                    if events:
+                        prompt += f"\n{events}"
+
+            # The agent's own results, so a losing pattern is visible to it.
+            from app.learning import format_record
+
+            record = format_record(self.agent_key)
+            if record:
+                prompt += f"\n\n{record}"
 
             # Get conversation history for context
             history = get_history(self.agent_key, limit=6)

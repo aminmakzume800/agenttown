@@ -34,7 +34,10 @@ from app.db import (
     realised_pnl,
 )
 from app.llm_client import chat_completion, model_for
+from app.learning import desk_record, format_record
 from app.market_data import get_candles, get_quote, quote_is_tradeable
+from app.news_calendar import calendar_context
+from app.trading.indicators import atr, format_indicators
 from app.trading.broker import BrokerError, broker, http_json
 from app.trading.execution import router as execution
 from app.trading.proposal import parse_proposal, risk_amount
@@ -505,14 +508,25 @@ class Autopilot:
                 f"{', open ' + str(tick['open']) if tick.get('open') else ''}."
             )
 
+        # Computed indicators and the event calendar, same as the chat path.
+        # Unattended decisions need this more than supervised ones, since nobody
+        # is there to notice the bot inventing an RSI value.
+        indicators = format_indicators(candles, symbol) if candles else ""
+        events = calendar_context(symbol)
+        record = format_record(bot_key)
+
         prompt = (
             f"{symbol} bid {tick['bid']} ask {tick['ask']} "
             f"(spread {tick.get('spread', 0)}, {tick['source']}, "
             f"{tick['age_sec']}s old).{session}\n"
             f"Last {profile['timeframe']} closes, oldest first: {closes or 'unavailable'}.\n"
-            f"Style: {settings.style_name()} — {profile['note']}\n"
+            + (f"\n{indicators}\n" if indicators else "")
+            + (f"\n{events}\n" if events else "")
+            + (f"\n{record}\n" if record else "")
+            + f"\nStyle: {settings.style_name()} — {profile['note']}\n"
             f"A buy fills at the ask, a sell at the bid. Quote an entry within "
             f"{float(profile['max_entry_drift_pct']) * 100:.3f}% of that side.\n"
+            f"Base the stop on the ATR above, not a round number.\n"
             f"Risk at most {max_size} lots. Reward must be at least {min_rr}x risk.\n"
             "Give the plan, or NO-TRADE."
         )
@@ -547,6 +561,8 @@ class Autopilot:
         )
         order["quote_source"] = tick.get("source")
         order["quote_age_sec"] = tick.get("age_sec")
+        # Carried so the clamp can check the stop against real volatility.
+        order["atr"] = atr(candles) if candles else None
         return order
 
     async def _poll_symbol(self, symbol: str) -> Optional[dict]:
@@ -600,6 +616,18 @@ class Autopilot:
             return False, "no take profit — unattended entries need a defined target"
         if order.get("rr") is None or order["rr"] < min_rr:
             return False, f"reward:risk {order.get('rr')} is below the {min_rr} minimum"
+
+        # A stop inside one ATR is inside normal movement: it gets hit by noise
+        # whether or not the direction was right. Measured, so it adapts to how
+        # volatile the instrument actually is right now.
+        measured_atr = order.get("atr")
+        if measured_atr:
+            distance = abs(float(order["entry_price"]) - float(order["stop_loss"]))
+            if distance < measured_atr:
+                return False, (
+                    f"stop is {distance:.5f} from entry, inside the {measured_atr:.5f} "
+                    f"ATR — ordinary noise would close it"
+                )
 
         # A level far from the live price will never fill, or fills at a price
         # the bot never reasoned about. The tolerance follows the trading style,
