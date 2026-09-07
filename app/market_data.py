@@ -54,6 +54,28 @@ def canonical(symbol: str) -> str:
     return CANONICAL.get(str(symbol).upper().replace(" ", ""), symbol)
 
 
+def fx_market_open(now: Optional[datetime] = None) -> tuple[bool, str]:
+    """Is the spot FX market open? Returns (open, description).
+
+    Spot FX runs Sunday 21:00 UTC to Friday 22:00 UTC. This lives here rather
+    than in the autopilot because the chat agents need it too: an agent that does
+    not know the market is shut will propose a weekend trade, the gate will
+    refuse it on stale prices, and the user is left with a confusing rejection
+    instead of simply being told the market is closed.
+
+    Costs nothing — a clock comparison, no network call.
+    """
+    now = now or datetime.now(timezone.utc)
+    weekday = now.weekday()          # Mon 0 ... Sun 6
+    if weekday == 5:
+        return False, "Saturday — FX market closed"
+    if weekday == 6 and now.hour < 21:
+        return False, "Sunday before 21:00 UTC — FX market closed"
+    if weekday == 4 and now.hour >= 22:
+        return False, "Friday after 22:00 UTC — FX market closed"
+    return True, "Market open"
+
+
 # ── quote cache ─────────────────────────────────────────────
 # Guards against one agent turn firing the same lookup several times. The TTL is
 # deliberately ~1s: this is de-duplication, not caching of old prices.

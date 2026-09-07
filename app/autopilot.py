@@ -36,7 +36,12 @@ from app.db import (
 )
 from app.llm_client import chat_completion, model_for
 from app.learning import desk_record, format_record
-from app.market_data import get_candles, get_quote, quote_is_tradeable
+from app.market_data import (
+    fx_market_open as market_session,
+    get_candles,
+    get_quote,
+    quote_is_tradeable,
+)
 from app.news_calendar import calendar_context
 from app.trading.indicators import atr, format_indicators
 from app.trading.manage import plan_stop_move, should_time_exit
@@ -314,6 +319,11 @@ class Autopilot:
 
     @staticmethod
     def fx_market_open(now: Optional[datetime] = None) -> tuple[bool, str]:
+        """Delegates to market_data so the chat path and the loop agree."""
+        return market_session(now)
+
+    @staticmethod
+    def _fx_market_open_legacy(now: Optional[datetime] = None) -> tuple[bool, str]:
         """Rough FX session gate in UTC.
 
         The spot market runs from Sunday 21:00 to Friday 22:00. Trading a

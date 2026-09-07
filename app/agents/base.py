@@ -49,28 +49,36 @@ def execution_capability() -> str:
     if where.get("warning"):
         lines.append(f"Caveat right now: {where['warning']}")
 
-    # Restating the live prices here, right next to the instruction to use them,
-    # is deliberate. Models otherwise reach for a familiar-looking level from
-    # training data (EUR/USD near 1.08, gold near 2350) which is thousands of
-    # pips stale and gets the whole plan rejected.
-    from app.market_data import get_quote
+    # Prices are NOT fetched here. This block is built on every reply, and
+    # pulling four quotes each time cost ~40s before the model was even called.
+    # The agents that trade already receive live prices through
+    # format_market_context(), so this only needs to state the rule.
+    lines += [
+        "",
+        "PRICES: use only the live figures given below in this prompt. Never quote a",
+        "level from memory — training-era prices are thousands of pips stale and any",
+        "plan built on one is rejected by the risk gate.",
+    ]
 
-    marks = []
-    for sym in ("EUR/USD", "XAU/USD", "GBP/USD", "NAS100"):
-        quote = get_quote(sym)
-        if quote and quote.get("last"):
-            marks.append(
-                f"  {sym}: bid {quote['bid']} / ask {quote['ask']} "
-                f"({quote['source']}, {quote['age_sec']:.0f}s old)"
-            )
-    if marks:
+    # Whether the market is even open. Cheap: a clock check, no network. Without
+    # this the agent proposes a trade at the weekend, the gate refuses it on
+    # stale prices, and the user is left with a confusing rejection instead of
+    # simply being told the market is shut.
+    from app.market_data import fx_market_open
+
+    is_open, session = fx_market_open()
+    if not is_open:
         lines += [
             "",
-            "LIVE PRICES RIGHT NOW — use these, never a remembered level:",
-            *marks,
-            "If a price you were about to quote differs from these by more than a",
-            "fraction of a percent, you are using stale knowledge. Use the number above.",
+            f"MARKET IS CLOSED right now — {session}.",
+            "Say so plainly, in one sentence, as the first thing you say. Spot FX",
+            "trades from Sunday 21:00 UTC to Friday 22:00 UTC.",
+            "Do not output a trade plan: prices are hours stale and any order would",
+            "be refused. You may still discuss analysis, levels to watch on the next",
+            "open, or answer general questions.",
         ]
+    else:
+        lines += ["", f"Market session: open ({session})."]
 
     lines += [
         "",
