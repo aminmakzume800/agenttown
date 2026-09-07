@@ -25,12 +25,6 @@ the user to place it manually, and do not claim you lack the means to act.
 
 When chatting casually, be professional but friendly."""
 
-    def get_canned_response(self, user_message: str, lang: str = "en") -> str:
-        msg = user_message.lower()
-        if lang == "bn":
-            if "trade" in msg or "ট্রেড" in msg:
-                return "[Manager Alice] ডেমো মোড: ট্রেড প্রস্তাব পর্যালোচনা করতে API কী প্রয়োজন।"
-            return "[Manager Alice] হ্যালো! আমি ম্যানেজার এলিস। আমি সব এজেন্ট সমন্বয় করি।"
-        if "trade" in msg or "buy" in msg or "sell" in msg:
-            return "[Manager Alice] Demo mode: I would review this trade proposal after Risk Manager validates it. Set API keys for real decisions."
-        return "[Manager Alice] Hello! I'm Alice, the Manager. I coordinate all agents and approve trades. How can I help?"
+    # No get_canned_response override on purpose. The base class reports the real
+    # reason a reply failed — a missing key versus an unreachable model — instead
+    # of claiming "demo mode, set API keys" when the keys are already working.

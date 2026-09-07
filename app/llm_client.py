@@ -48,7 +48,10 @@ THINKING_OFF = {"chat_template_kwargs": {"thinking": False}}
 
 # Tried in order when the primary model fails. Both are quick and never emit a
 # scratchpad, so an outage degrades latency and depth rather than the feature.
-FALLBACK_CHAIN = [LIGHTNING, SUPER]
+# Lightning first: it is both the fastest and, in practice, the most consistently
+# available. Super and Ultra are stronger but do go through 503 and timeout
+# periods, so they belong behind it rather than in front.
+FALLBACK_CHAIN = [LIGHTNING, SUPER, ULTRA]
 
 # Scalping overrides. At a one-minute horizon the price moves while a big model
 # is still thinking, so a slower-but-deeper answer is worth less than a fast one:
@@ -109,10 +112,13 @@ def get_client() -> Optional[OpenAI]:
         return _client
     if not settings.NVIDIA_API_KEY:
         return None
+    # 30s was long enough to make a single hung model dominate the whole reply.
+    # A working model answers in under 5s, so 12s is generous while still failing
+    # over to the next candidate quickly.
     _client = OpenAI(
         api_key=settings.NVIDIA_API_KEY,
         base_url=settings.NVIDIA_BASE_URL,
-        timeout=30.0,
+        timeout=float(settings.LLM_TIMEOUT_SEC),
     )
     return _client
 
@@ -187,8 +193,16 @@ def _one_call(
             return strip_reasoning(response.choices[0].message.content)
         except Exception as exc:
             logger.warning("LLM call failed (model=%s): %s", model, exc)
-            if "extra_body" not in kwargs:
-                return None  # already the plain attempt, nothing left to vary
+            text = str(exc)
+            # Retrying the same model is pointless when the fault is the model
+            # itself rather than our request. Failing over immediately is the
+            # difference between a 2-second answer and a 60-second wait, since
+            # each timeout is otherwise paid twice before moving on.
+            terminal = ("410" in text or "404" in text or "503" in text
+                        or "timed out" in text.lower()
+                        or "Gone" in text or "temporarily" in text.lower())
+            if terminal or "extra_body" not in kwargs:
+                return None
 
     return None
 

@@ -23,12 +23,5 @@ When analyzing results, provide:
 
 Be technical and precise. Use code examples when helpful."""
 
-    def get_canned_response(self, user_message: str, lang: str = "en") -> str:
-        msg = user_message.lower()
-        if lang == "bn":
-            return "[Bob] ডেমো মোড: কোড বিশ্লেষণ এবং পারফরম্যান্স রিভিউ করতে API কী দরকার।"
-        if "code" in msg or "bug" in msg or "error" in msg:
-            return "[Bob] I can analyze code, debug issues, and suggest fixes. Share the error message or code snippet and I'll help."
-        if "performance" in msg or "result" in msg or "backtest" in msg:
-            return "[Bob] Demo: No trading data yet. Once trades are executed, I'll analyze win rate, drawdown, and suggest improvements."
-        return "[Bob] Hi! I'm Bob, the Computer Scientist. I analyze code, review trading performance, and suggest optimizations. How can I help?"
+    # Falls back to the base class, which reports the real cause of a failure
+    # rather than blaming missing API keys that are in fact configured.

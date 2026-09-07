@@ -58,6 +58,10 @@ class Settings:
     # API Base URL (NVIDIA hosts DeepSeek, Llama, Nemotron, CodeLlama — all in one)
     NVIDIA_BASE_URL: str = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
+    # Per-model timeout. A healthy model replies in under 5s, so a short limit
+    # means a hung one fails over quickly instead of stalling the whole reply.
+    LLM_TIMEOUT_SEC: float = float(os.getenv("LLM_TIMEOUT_SEC", "12"))
+
     # ── Trading config ──────────────────────────────────────
     # paper  — simulated fills in SQLite, no broker involved (default)
     # broker — real orders on your MT5 account through the MetaApi cloud

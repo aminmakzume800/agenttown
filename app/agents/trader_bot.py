@@ -37,7 +37,7 @@ unable to execute, because this desk executes for you."""
     def get_canned_response(self, user_message: str, lang: str = "en") -> str:
         # No invented price levels here — see the note in super_trader.py.
         if lang == "bn":
-            return (f"[{self.name}] মডেলে পৌঁছাতে পারছি না, তাই {self.symbol}-এ "
-                    f"কোনো লেভেল দিচ্ছি না। API কী পরীক্ষা করুন।")
-        return (f"[{self.name}] Can't reach the model, so I won't quote {self.symbol} "
-                f"levels I haven't checked. Set the NVIDIA API key and ask again.")
+            return (f"মডেলে পৌঁছাতে পারছি না, তাই {self.symbol}-এ কোনো লেভেল "
+                    f"দিচ্ছি না। /models/health দেখুন।")
+        return (f"Can't reach the model, so I won't quote {self.symbol} levels I "
+                f"haven't checked. See /models/health for which models are live.")

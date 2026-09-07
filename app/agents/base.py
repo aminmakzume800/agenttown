@@ -41,6 +41,28 @@ def execution_capability() -> str:
            else " — simulated fills, no broker contacted."),
     ]
 
+    # State the credential situation as fact. Without this the model fills the
+    # gap from its prior and asserts things like "the bot is in demo mode, still
+    # waiting for API keys" — which was never true here and misleads the user
+    # into thinking setup is incomplete.
+    from app.config import settings as _s
+
+    lines += [
+        "",
+        "SYSTEM STATE — these are facts, do not contradict them:",
+        f"  LLM API key configured: {'YES' if _s.NVIDIA_API_KEY else 'NO'}"
+        + (" — you are running on a real model right now."
+           if _s.NVIDIA_API_KEY else ""),
+        f"  Broker credentials configured: {'YES' if _s.METAAPI_TOKEN else 'NO'}",
+        f"  Broker order sending enabled: {'YES' if _s.BROKER_TRADING_ENABLED else 'NO'}",
+        f"  Rule-based entry engine active: {'YES' if _s.REQUIRE_RULE_SETUP else 'NO'}",
+        "  Never tell the user the desk is 'in demo mode waiting for API keys' when",
+        "  the lines above say the keys are configured. Never say a bot cannot trade",
+        "  yet because of missing setup. If something really is missing, it is named",
+        "  above — quote that, nothing else.",
+        "  Do not prefix your reply with your own name in brackets.",
+    ]
+
     if where["mode"] == "broker":
         lines.append(
             "The MT5 bridge IS connected. Never tell the user you have no broker "
@@ -244,10 +266,29 @@ class BaseAgent:
             self.status = "idle"
 
     def get_canned_response(self, user_message: str, lang: str = "en") -> str:
-        """Fallback response when no API key or API fails."""
+        """Fallback when the model cannot be reached.
+
+        Distinguishes a missing key from a model outage. Saying "set your API
+        keys" when the key is present sends the user chasing a problem that does
+        not exist — the far more common cause is a retired model, which is a
+        different fix entirely.
+        """
+        from app.config import settings
+
+        if not settings.NVIDIA_API_KEY:
+            if lang == "bn":
+                return ("API কী সেট করা নেই। .env ফাইলে NVIDIA_API_KEY যোগ করুন।")
+            return ("No LLM API key is configured. Add NVIDIA_API_KEY to .env "
+                    "and restart.")
+
         if lang == "bn":
-            return f"[{self.name}] আমি এখন ডেমো মোডে আছি। API কী সেট করুন।"
-        return f"[{self.name}] I'm in demo mode. Set API keys in .env for real responses."
+            return ("মডেলে পৌঁছাতে পারছি না — কী ঠিক আছে, তাই সম্ভবত মডেলটি "
+                    "অবসরপ্রাপ্ত। /models/health দেখুন।")
+        return (
+            "I couldn't reach the language model just now. The API key IS "
+            "configured, so this is usually a retired model rather than a setup "
+            "problem — check /models/health to see which models are still live."
+        )
 
     def to_dict(self) -> dict:
         """Serialize agent info for API responses."""

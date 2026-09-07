@@ -36,8 +36,8 @@ the reason — that is a real answer, unlike claiming you are unable to act."""
         # unreachable, and any levels here would be invented — the parser would
         # turn them into a real order ticket off a made-up price.
         if lang == "bn":
-            return ("[Super Trader] মডেলে পৌঁছাতে পারছি না, তাই এখন কোনো ট্রেড "
-                    "পরিকল্পনা দিচ্ছি না। NVIDIA API কী পরীক্ষা করুন।")
-        return ("[Super Trader] I can't reach the analysis model right now, so I "
-                "won't quote levels I haven't verified — an invented entry would "
-                "become a real order ticket. Check the NVIDIA API key and ask again.")
+            return ("মডেলে পৌঁছাতে পারছি না, তাই এখন কোনো ট্রেড পরিকল্পনা "
+                    "দিচ্ছি না। /models/health দেখুন।")
+        return ("I can't reach the analysis model right now, so I won't quote "
+                "levels I haven't verified — an invented entry would become a "
+                "real order ticket. Check /models/health for live models.")
