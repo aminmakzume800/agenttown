@@ -313,10 +313,45 @@ class BrokerBridge:
             "max_volume": float(spec.get("maxVolume") or 100.0),
             "volume_step": float(spec.get("volumeStep") or 0.01),
             "digits": int(spec.get("digits") or 5),
+            # Brokers publish quotes for instruments they will not let you
+            # trade. Without this the symbol looks fine right up until the order
+            # is rejected, which is a confusing place to find out.
+            "trade_mode": str(spec.get("tradeMode") or ""),
         }
         with self._lock:
             self._specs[symbol] = trimmed
         return trimmed
+
+    def is_tradeable(self, canonical: str) -> tuple[bool, str]:
+        """Will this account actually accept an order on this instrument?
+
+        Quotes being available does not mean trading is allowed. Demo servers
+        commonly carry index feeds with tradeMode DISABLED, so the symbol looks
+        healthy until the order is refused. Checking here means the proposal can
+        be rejected with a clear reason instead of failing after approval.
+        """
+        spec = self.specification(canonical)
+        if not spec:
+            return False, f"{canonical} is not offered by this broker."
+
+        mode = spec["trade_mode"].upper()
+        symbol = spec["broker_symbol"]
+        if "FULL" in mode:
+            return True, f"{symbol} is fully tradeable."
+        if "DISABLED" in mode:
+            return False, (
+                f"{symbol} is quote-only on this account — the broker publishes "
+                f"prices for it but does not accept orders (tradeMode "
+                f"{spec['trade_mode']}). Point BROKER_SYMBOL_* at a tradeable "
+                f"instrument, or trade something else."
+            )
+        if "CLOSEONLY" in mode.replace("_", ""):
+            return False, f"{symbol} is close-only right now — no new positions."
+        if "LONGONLY" in mode.replace("_", ""):
+            return True, f"{symbol} allows long positions only."
+        if "SHORTONLY" in mode.replace("_", ""):
+            return True, f"{symbol} allows short positions only."
+        return True, f"{symbol} trade mode {spec['trade_mode']}."
 
     def normalise_volume(self, canonical: str, volume: float) -> tuple[float, str]:
         """Round a size to something the broker will actually accept.

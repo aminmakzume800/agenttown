@@ -126,6 +126,29 @@ def check_symbol_exposure(symbol: str, size: float) -> tuple[bool, str]:
     return True, f"{symbol} exposure {total:.2f}/{settings.MAX_POSITION_SIZE:.2f} lots OK."
 
 
+def check_symbol_tradeable(symbol: str) -> tuple[bool, str]:
+    """Will the broker accept an order on this instrument at all?
+
+    Catches the case where a broker streams prices for something it will not let
+    you trade. Checked here so the proposal is refused with a clear reason,
+    rather than passing every gate and then failing after you click approve.
+    """
+    from app.trading.execution import router
+
+    if not router.is_broker:
+        return True, "Paper mode — no broker symbol restrictions."
+
+    from app.trading.broker import broker
+
+    if not broker.is_configured:
+        return True, "Broker not configured — symbol check skipped."
+    try:
+        ok, reason = broker.is_tradeable(symbol)
+    except Exception as exc:
+        return True, f"Could not verify symbol with broker ({str(exc)[:60]})."
+    return ok, reason
+
+
 def check_price_freshness(symbol: str, entry_price: float, side: str) -> tuple[bool, str]:
     """Reject an order priced off a stale quote, or too far from the market.
 
@@ -185,6 +208,7 @@ def evaluate_order(order: dict) -> tuple[bool, list[str]]:
     entry = float(order.get("entry_price", 0) or 0)
 
     results = [
+        check_symbol_tradeable(symbol),
         check_position_size(size),
         check_daily_drawdown(risk),
         check_max_trades(),
