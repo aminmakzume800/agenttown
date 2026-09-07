@@ -32,6 +32,7 @@ from app.db import (
     get_open_positions,
     log_event,
     realised_pnl,
+    record_partial,
     update_stop,
 )
 from app.llm_client import chat_completion, model_for
@@ -44,7 +45,7 @@ from app.market_data import (
 )
 from app.news_calendar import calendar_context
 from app.trading.indicators import atr, format_indicators
-from app.trading.manage import plan_stop_move, should_time_exit
+from app.trading.manage import plan_profit_take, plan_stop_move, should_time_exit
 from app.trading.strategy import (
     MIN_CONFLUENCE,
     evaluate_setup,
@@ -515,7 +516,95 @@ class Autopilot:
                 adopted,
             )
 
-    async def _protect(self, pos: dict, price: float) -> None:
+    async def manage_open_positions(self) -> dict:
+        """Review every open position once: bank profit, protect, or exit.
+
+        Callable independently of the loop, because a position opened from chat
+        needs managing whether or not the autopilot is running. That gap is why a
+        trade could sit open indefinitely with nothing watching it.
+        """
+        actions: list[dict] = []
+        positions = await asyncio.to_thread(get_open_positions)
+        if not positions:
+            return {"reviewed": 0, "actions": []}
+
+        for pos in positions:
+            quote = await asyncio.to_thread(get_quote, pos["symbol"])
+            if not quote:
+                continue
+            is_long = str(pos.get("direction", "")).lower() in ("buy", "long")
+            # Value the position at the price it would actually exit at.
+            price = float(quote["bid"] if is_long else quote["ask"])
+
+            # 1. Bank part of a decent gain rather than risk giving it back.
+            banked = await self._bank_profit(pos, price)
+            if banked:
+                actions.append(banked)
+                pos = next((p for p in await asyncio.to_thread(get_open_positions)
+                            if p["id"] == pos["id"]), pos)
+
+            # 2. Move the stop so the remainder cannot lose.
+            moved = await self._protect(pos, price)
+            if moved:
+                actions.append(moved)
+
+        return {"reviewed": len(positions), "actions": actions}
+
+    async def _bank_profit(self, pos: dict, price: float) -> Optional[dict]:
+        """Close part of a winning position to realise some of the gain."""
+        plan = plan_profit_take(pos, price, bool(pos.get("partial_taken")))
+        if not plan:
+            return None
+
+        size = float(pos["size"])
+        symbol = pos["symbol"]
+        broker_pid = pos.get("broker_position_id")
+
+        if execution.is_broker and broker_pid:
+            ok, volume = await asyncio.to_thread(
+                broker.can_split, symbol, size, plan["fraction"])
+            if not ok:
+                # Too small to split without leaving an invalid remainder.
+                return None
+            try:
+                result = await asyncio.to_thread(
+                    broker.close_partial, broker_pid, volume, symbol)
+            except BrokerError as exc:
+                await self._emit("warn", f"{symbol}: partial close failed — {exc}")
+                return None
+            if not result.get("ok"):
+                await self._emit(
+                    "warn",
+                    f"{symbol}: broker refused the partial close "
+                    f"({result.get('message')})",
+                )
+                return None
+        else:
+            volume = round(size * plan["fraction"], 2)
+            if volume < 0.01 or round(size - volume, 2) < 0.01:
+                return None
+
+        banked = realised_pnl(
+            symbol=symbol, direction=pos["direction"], size=volume,
+            entry_price=float(pos["entry_price"]), exit_price=price,
+        )
+        await asyncio.to_thread(record_partial, pos["id"], volume, banked)
+        log_event(
+            agent_key="autopilot",
+            action_type="partial_close",
+            detail=f"{symbol} banked {volume} lots at {price} for {banked:+.2f} USD",
+            metadata=f"position={pos['id']} r={plan['r_multiple']} {plan['reason']}",
+        )
+        await self._emit(
+            "trade",
+            f"{symbol}: {plan['reason']} — took {volume} lots for {banked:+.2f} USD",
+            {"position_id": pos["id"], "volume": volume, "pnl": banked},
+        )
+        self._notify(f"Banked {banked:+.2f} USD on {symbol} at {plan['r_multiple']}R")
+        return {"position_id": pos["id"], "kind": "partial_close",
+                "volume": volume, "pnl": banked}
+
+    async def _protect(self, pos: dict, price: float) -> Optional[dict]:
         """Tighten the stop on a position that is in profit.
 
         Break-even first, then trailing. This is the part that turns a good entry
@@ -536,7 +625,7 @@ class Autopilot:
 
         move = plan_stop_move(pos, price, atr_value)
         if not move:
-            return
+            return None
 
         moved = False
         broker_pid = pos.get("broker_position_id")
@@ -553,15 +642,15 @@ class Autopilot:
                         f"{pos['symbol']}: broker refused the stop move "
                         f"({result.get('message')})",
                     )
-                    return
+                    return None
             except BrokerError as exc:
                 await self._emit("warn", f"{pos['symbol']}: stop move failed — {exc}")
-                return
+                return None
         else:
             moved = True                     # paper: the local row is the book
 
         if not moved:
-            return
+            return None
 
         await asyncio.to_thread(update_stop, pos["id"], move["new_stop"])
         log_event(
@@ -577,6 +666,8 @@ class Autopilot:
             {"position_id": pos["id"], "new_stop": move["new_stop"],
              "kind": move["kind"], "r_multiple": move["r_multiple"]},
         )
+        return {"position_id": pos["id"], "kind": move["kind"],
+                "new_stop": move["new_stop"], "r_multiple": move["r_multiple"]}
 
     # ── idea generation ─────────────────────────────────────
 

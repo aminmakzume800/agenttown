@@ -87,6 +87,10 @@ def _migrate_positions(conn: sqlite3.Connection) -> None:
         ("opened_by", "ALTER TABLE positions ADD COLUMN opened_by TEXT DEFAULT 'user'"),
         ("broker_position_id", "ALTER TABLE positions ADD COLUMN broker_position_id TEXT"),
         ("broker_symbol", "ALTER TABLE positions ADD COLUMN broker_symbol TEXT"),
+        # Records that profit has already been banked once, so the partial does
+        # not fire repeatedly on the same trade.
+        ("partial_taken", "ALTER TABLE positions ADD COLUMN partial_taken INTEGER DEFAULT 0"),
+        ("banked_pnl", "ALTER TABLE positions ADD COLUMN banked_pnl REAL DEFAULT 0"),
     ):
         if column not in have:
             conn.execute(ddl)
@@ -245,6 +249,36 @@ def update_stop(position_id: str, stop_loss: float,
             )
         conn.commit()
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def record_partial(position_id: str, closed_volume: float, banked: float) -> bool:
+    """Reduce a position's size after banking part of it.
+
+    The realised amount is accumulated on the row so the final P&L reflects both
+    the part taken early and the part left to run.
+    """
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT size, banked_pnl FROM positions WHERE id = ? AND status = 'open'",
+            (position_id,),
+        ).fetchone()
+        if not row:
+            return False
+        remaining = round(float(row["size"]) - float(closed_volume), 4)
+        if remaining <= 0:
+            return False
+        conn.execute(
+            """UPDATE positions
+               SET size = ?, partial_taken = 1, banked_pnl = ?
+               WHERE id = ?""",
+            (remaining, round(float(row["banked_pnl"] or 0) + float(banked), 2),
+             position_id),
+        )
+        conn.commit()
+        return True
     finally:
         conn.close()
 

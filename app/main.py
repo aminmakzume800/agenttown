@@ -28,7 +28,15 @@ from app.llm_client import probe_models
 from app.learning import agent_record, desk_record, format_record
 from app.news_calendar import SYMBOL_CURRENCIES, news_blackout, upcoming_events
 from app.trading.indicators import compute_all
-from app.memory import init_memory_table, get_history, clear_history
+from app.memory import (
+    clear_history,
+    forget,
+    get_history,
+    init_knowledge_table,
+    init_memory_table,
+    recall,
+    remember,
+)
 from app.market_data import (
     clear_quote_cache,
     entry_price_for,
@@ -144,6 +152,7 @@ def engage_kill_switch(reason: str = "activated by user") -> dict:
 async def startup():
     init_db()
     init_memory_table()
+    init_knowledge_table()
 
     autopilot.bind(
         pending_store=PENDING,
@@ -435,6 +444,53 @@ def tts(req: TTSRequest):
         media_type="audio/wav",
         headers={"Cache-Control": "no-store"},
     )
+
+
+class KnowledgeRequest(BaseModel):
+    """Something the agent should remember permanently.
+    Use agent_key='all' for a desk-wide rule every agent sees."""
+    agent_key: str
+    content: str
+    kind: str = "instruction"
+
+
+@app.get("/knowledge/{agent_key}")
+def knowledge_get(agent_key: str):
+    """What this agent has been told and still remembers."""
+    return {"ok": True, "agent_key": agent_key, "items": recall(agent_key)}
+
+
+@app.post("/knowledge")
+def knowledge_add(req: KnowledgeRequest):
+    """Teach an agent something that outlives the chat window."""
+    if req.agent_key != "all" and req.agent_key not in ALL_AGENTS:
+        raise HTTPException(status_code=404, detail=f"Agent '{req.agent_key}' not found")
+    stored = remember(req.agent_key, req.content, kind=req.kind, source="api")
+    if stored:
+        log_event(agent_key=req.agent_key, action_type="knowledge_saved",
+                  detail=f"({req.kind}) {req.content[:150]}")
+    return {"ok": True, "stored": stored, "items": recall(req.agent_key)}
+
+
+@app.delete("/knowledge/{agent_key}")
+def knowledge_clear(agent_key: str, knowledge_id: Optional[int] = Query(None)):
+    """Forget one item, or everything this agent was told."""
+    removed = forget(agent_key, knowledge_id)
+    return {"ok": True, "removed": removed, "items": recall(agent_key)}
+
+
+@app.post("/positions/manage")
+def positions_manage():
+    """Review every open position once: bank profit, protect, or exit.
+
+    This is the same logic the autopilot runs each cycle, exposed so positions
+    are managed even when the loop is stopped. Without it a trade opened from
+    chat has nothing watching it, which is how a winner turns into a loss.
+    """
+    import asyncio
+
+    result = asyncio.run(autopilot.manage_open_positions())
+    return {"ok": True, **result}
 
 
 @app.get("/indicators/{symbol:path}")

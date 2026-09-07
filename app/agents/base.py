@@ -182,6 +182,15 @@ class BaseAgent:
             if record:
                 prompt += f"\n\n{record}"
 
+            # Anything the user has told this agent previously. Chat history is a
+            # rolling window of a few turns, so instructions given earlier would
+            # otherwise scroll out of context and be forgotten.
+            from app.memory import format_knowledge
+
+            knowledge = format_knowledge(self.agent_key)
+            if knowledge:
+                prompt += f"\n\n{knowledge}"
+
             # Get conversation history for context
             history = get_history(self.agent_key, limit=6)
 
@@ -209,6 +218,18 @@ class BaseAgent:
             # Save to memory
             save_message(self.agent_key, "user", user_message)
             save_message(self.agent_key, "assistant", response)
+
+            # Durable capture: pull any standing instruction out of what the user
+            # said and keep it, so it still applies in a week's time.
+            from app.memory import extract_knowledge, remember
+
+            for kind, content in extract_knowledge(user_message):
+                if remember(self.agent_key, content, kind=kind, source="chat"):
+                    log_event(
+                        agent_key=self.agent_key,
+                        action_type="knowledge_saved",
+                        detail=f"({kind}) {content[:120]}",
+                    )
 
             # Log the interaction
             log_event(

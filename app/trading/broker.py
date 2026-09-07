@@ -145,6 +145,7 @@ class BrokerBridge:
     def __init__(self) -> None:
         self._symbols: Optional[list[str]] = None
         self._symbol_map: dict[str, Optional[str]] = {}
+        self._specs: dict[str, dict] = {}
         self._lock = threading.Lock()
 
     def reset_cache(self) -> None:
@@ -156,6 +157,7 @@ class BrokerBridge:
         with self._lock:
             self._symbols = None
             self._symbol_map.clear()
+            self._specs.clear()
 
     # ── configuration ───────────────────────────────────────
 
@@ -282,6 +284,73 @@ class BrokerBridge:
             "connection_status": data.get("connectionStatus"),
             "region": data.get("region"),
         }
+
+    def specification(self, canonical: str) -> Optional[dict]:
+        """Broker's contract rules for one instrument.
+
+        The important fields are minVolume and volumeStep. They differ per
+        instrument and per broker: EURUSD trades in 0.01 steps, but an index
+        like USTEC often has a 0.1 minimum. Sending 0.01 there is rejected
+        outright, which looks like a broken app rather than an invalid size.
+        Cached because these values do not change.
+        """
+        symbol = self.symbol_for(canonical)
+        if not symbol:
+            return None
+        with self._lock:
+            if symbol in self._specs:
+                return self._specs[symbol]
+        try:
+            spec = self._get(f"/symbols/{symbol}/specification")
+        except BrokerError as exc:
+            logger.warning("Could not read spec for %s: %s", symbol, exc)
+            return None
+        if not isinstance(spec, dict):
+            return None
+        trimmed = {
+            "broker_symbol": symbol,
+            "min_volume": float(spec.get("minVolume") or 0.01),
+            "max_volume": float(spec.get("maxVolume") or 100.0),
+            "volume_step": float(spec.get("volumeStep") or 0.01),
+            "digits": int(spec.get("digits") or 5),
+        }
+        with self._lock:
+            self._specs[symbol] = trimmed
+        return trimmed
+
+    def normalise_volume(self, canonical: str, volume: float) -> tuple[float, str]:
+        """Round a size to something the broker will actually accept.
+
+        Returns (volume, note). Rounds down to the nearest step so a risk cap is
+        never exceeded by rounding, then lifts to the minimum if that leaves the
+        size below what the broker allows.
+        """
+        spec = self.specification(canonical)
+        if not spec:
+            return round(volume, 2), ""
+
+        step = spec["volume_step"] or 0.01
+        minimum = spec["min_volume"]
+        maximum = spec["max_volume"]
+
+        steps = int(round(float(volume) / step + 1e-9))
+        snapped = round(steps * step, 4)
+        # Never round up past what was asked for.
+        if snapped > volume + 1e-9:
+            snapped = round(max(steps - 1, 0) * step, 4)
+
+        note = ""
+        if snapped < minimum:
+            snapped = minimum
+            note = (f"size raised to the broker minimum {minimum} for "
+                    f"{spec['broker_symbol']}")
+        elif abs(snapped - volume) > 1e-9:
+            note = (f"size rounded {volume} -> {snapped} to the "
+                    f"{step} step for {spec['broker_symbol']}")
+        if snapped > maximum:
+            snapped = maximum
+            note = f"size capped at the broker maximum {maximum}"
+        return round(snapped, 4), note
 
     def symbols(self, refresh: bool = False) -> list[str]:
         """Every instrument the account can trade. Cached — the list is static."""
@@ -465,10 +534,17 @@ class BrokerBridge:
         if not symbol:
             raise BrokerError(f"Broker does not offer {canonical_symbol}.")
 
+        # Snap to the broker's volume step before sending. Indices commonly have
+        # a 0.1 minimum where FX has 0.01, and an off-step size is rejected with
+        # an unhelpful error that looks like a broken integration.
+        adjusted, note = self.normalise_volume(canonical_symbol, float(volume))
+        if note:
+            logger.info("%s: %s", canonical_symbol, note)
+
         body: dict = {
             "actionType": "ORDER_TYPE_BUY" if side.lower() in ("buy", "long") else "ORDER_TYPE_SELL",
             "symbol": symbol,
-            "volume": round(float(volume), 2),
+            "volume": adjusted,
         }
         if stop_loss:
             body["stopLoss"] = float(stop_loss)
@@ -485,6 +561,9 @@ class BrokerBridge:
         result["broker_symbol"] = symbol
         result["direction"] = side.lower()
         result["size"] = body["volume"]
+        result["requested_size"] = float(volume)
+        if note:
+            result["size_note"] = note
         return result
 
     def modify_position(
@@ -512,6 +591,43 @@ class BrokerBridge:
         if take_profit:
             body["takeProfit"] = float(take_profit)
         return self._trade(body)
+
+    def close_partial(self, broker_position_id: str, volume: float,
+                      canonical_symbol: str = "") -> dict:
+        """Close part of a position, banking some profit and leaving the rest.
+
+        The volume still has to respect the broker's step rules, and the residual
+        must remain tradeable — closing 0.05 of a 0.1 index position would leave
+        an invalid remainder, so that is refused rather than attempted.
+        """
+        if not self.trading_enabled:
+            raise BrokerError("Broker trading is switched off — cannot close partially.")
+
+        if canonical_symbol:
+            volume, _ = self.normalise_volume(canonical_symbol, volume)
+        return self._trade({
+            "actionType": "POSITION_PARTIAL",
+            "positionId": str(broker_position_id),
+            "volume": round(float(volume), 4),
+        })
+
+    def can_split(self, canonical_symbol: str, size: float, fraction: float) -> tuple[bool, float]:
+        """Is a partial close valid here? Returns (ok, volume_to_close).
+
+        Both halves must be at least the broker minimum and on-step, otherwise
+        the partial is impossible and the position should be managed whole.
+        """
+        spec = self.specification(canonical_symbol)
+        if not spec:
+            return False, 0.0
+        step, minimum = spec["volume_step"], spec["min_volume"]
+        to_close, _ = self.normalise_volume(canonical_symbol, size * fraction)
+        remainder = round(size - to_close, 4)
+        if to_close < minimum or remainder < minimum:
+            return False, 0.0
+        if abs(round(remainder / step) * step - remainder) > 1e-6:
+            return False, 0.0
+        return True, to_close
 
     def close_position(self, broker_position_id: str) -> dict:
         """Close one position at market."""

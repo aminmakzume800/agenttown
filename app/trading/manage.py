@@ -50,8 +50,8 @@ def plan_stop_move(
     trail_distance = (atr_value or risk) * float(settings.TRAIL_ATR_MULT)
     buffer = risk * 0.05                 # small allowance for spread
 
-    # Trailing takes over once the trade is well in profit.
-    if r_multiple >= float(settings.TRAIL_START_R):
+    # Same rounding tolerance as plan_profit_take, for the same reason.
+    if r_multiple >= float(settings.TRAIL_START_R) - 1e-6:
         candidate = (current_price - trail_distance if is_long
                      else current_price + trail_distance)
         kind, reason = "trail", (
@@ -59,7 +59,7 @@ def plan_stop_move(
             f"{trail_distance:.5f} behind price"
         )
     # Before that, the first job is to remove the risk of a loss.
-    elif r_multiple >= float(settings.BREAK_EVEN_R):
+    elif r_multiple >= float(settings.BREAK_EVEN_R) - 1e-6:
         candidate = (entry + buffer) if is_long else (entry - buffer)
         kind, reason = "break_even", (
             f"{r_multiple:.1f}R in profit — stop to entry, the trade can no "
@@ -84,6 +84,56 @@ def plan_stop_move(
 
     return {"new_stop": candidate, "reason": reason, "kind": kind,
             "r_multiple": round(r_multiple, 2)}
+
+
+def plan_profit_take(
+    position: dict,
+    current_price: float,
+    already_banked: bool = False,
+) -> Optional[dict]:
+    """Should part of this position be closed to bank profit?
+
+    Reasoning: a target sitting far away is often never reached, and giving back
+    an open profit of 2R because price stalled is the most avoidable loss there
+    is. Taking half off at a set multiple locks in a real gain, and the balance
+    then runs with a break-even or trailing stop — so the remainder cannot lose.
+
+    Returns {fraction, reason, r_multiple} or None. Only fires once per position.
+    """
+    if already_banked:
+        return None
+
+    entry = float(position["entry_price"])
+    stop = float(position.get("stop_loss") or 0)
+    size = float(position.get("size") or 0)
+    if stop <= 0 or size <= 0:
+        return None
+
+    is_long = str(position.get("direction", "")).lower() in ("buy", "long")
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+
+    progress = (current_price - entry) if is_long else (entry - current_price)
+    r_multiple = progress / risk
+    trigger = float(settings.PARTIAL_TAKE_R)
+    # Small tolerance: prices are rounded to 5 decimals, so a genuine 1.5R can
+    # compute as 1.4999 and would otherwise be missed at the exact trigger.
+    if r_multiple < trigger - 1e-6:
+        return None
+
+    fraction = float(settings.PARTIAL_TAKE_FRACTION)
+    if fraction <= 0 or fraction >= 1:
+        return None
+
+    return {
+        "fraction": fraction,
+        "r_multiple": round(r_multiple, 2),
+        "reason": (
+            f"{r_multiple:.1f}R in profit — banking {int(fraction * 100)}% and "
+            f"letting the rest run with a protected stop"
+        ),
+    }
 
 
 def should_time_exit(position: dict, bars_held: int) -> tuple[bool, str]:

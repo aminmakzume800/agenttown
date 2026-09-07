@@ -244,13 +244,19 @@ class ExecutionRouter:
             return {"ok": False, "status": "broker_error", "error": str(exc), "mode": "broker"}
 
         if not result.get("ok"):
+            # Say what the broker actually objected to. "Execution failed" with
+            # no reason is the least useful message possible when the real cause
+            # is something specific like an invalid volume step.
+            reason = self._explain_rejection(result, symbol, size)
             log_event(
                 agent_key=agent_key,
                 action_type="trade_rejected",
-                detail=f"Broker rejected {direction} {size} {symbol}",
-                metadata=f"code={result.get('code')} {result.get('message')}",
+                detail=f"Broker rejected {direction} {size} {symbol}: {reason}",
+                metadata=f"code={result.get('code')} {result.get('message')} "
+                         f"sent_volume={result.get('size')}",
             )
-            return {**result, "mode": "broker", "status": result.get("status") or "rejected"}
+            return {**result, "mode": "broker", "error": reason,
+                    "status": result.get("status") or "rejected"}
 
         broker_pid = result.get("broker_position_id")
         fill_price = self._fill_price(broker_pid) or entry_price
@@ -285,6 +291,48 @@ class ExecutionRouter:
             "status": "filled_broker",
             "mode": "broker",
         }
+
+    @staticmethod
+    def _explain_rejection(result: dict, symbol: str, size: float) -> str:
+        """Turn an MT5 return code into something actionable.
+
+        These codes are opaque on their own, and the common causes have specific
+        fixes. Naming the cause saves guessing at whether the app is broken.
+        """
+        code = result.get("code")
+        message = str(result.get("message") or "").strip()
+
+        explanations = {
+            10004: "requote — the price moved while the order was in flight",
+            10006: "rejected by the broker",
+            10013: "invalid request — usually a bad volume, stop or target",
+            10014: (f"invalid volume. {symbol} may not accept {size} lots; "
+                    f"check its minimum and step size"),
+            10015: "invalid price",
+            10016: "invalid stop or target level (too close to the market?)",
+            10017: "trading is disabled on this account",
+            10018: "the market for this instrument is closed",
+            10019: "not enough money for this position size",
+            10027: "algorithmic trading is disabled on the account",
+            10030: "unsupported order filling mode",
+            10031: "no connection between the terminal and the broker",
+        }
+        detail = explanations.get(code)
+
+        # A bad volume is the likeliest cause when the size is off-step, so say
+        # what the broker will actually accept.
+        if code in (10013, 10014) or "volume" in message.lower():
+            spec = broker.specification(symbol)
+            if spec:
+                detail = (
+                    f"invalid volume. {symbol} ({spec['broker_symbol']}) needs a "
+                    f"minimum of {spec['min_volume']} lots in steps of "
+                    f"{spec['volume_step']} — {size} does not fit"
+                )
+
+        if detail:
+            return f"{detail} (broker code {code})"
+        return message or f"broker refused the order (code {code})"
 
     @staticmethod
     def _fill_price(broker_pid: Optional[str]) -> Optional[float]:

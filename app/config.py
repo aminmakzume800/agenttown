@@ -130,6 +130,12 @@ class Settings:
     # Close a position that has gone nowhere for this many bars. 0 disables.
     MAX_BARS_IN_TRADE: int = int(os.getenv("MAX_BARS_IN_TRADE", "24"))
 
+    # Bank part of the position once it is this many risk-units ahead, then let
+    # the rest run behind a protected stop. A target that is never reached and an
+    # open profit given back is the most avoidable loss there is.
+    PARTIAL_TAKE_R: float = float(os.getenv("PARTIAL_TAKE_R", "1.5"))
+    PARTIAL_TAKE_FRACTION: float = float(os.getenv("PARTIAL_TAKE_FRACTION", "0.5"))
+
     # Fraction of the account risked per trade. Fixed-fractional sizing shrinks
     # the position automatically during a losing run.
     RISK_PER_TRADE_PCT: float = float(os.getenv("RISK_PER_TRADE_PCT", "0.005"))
